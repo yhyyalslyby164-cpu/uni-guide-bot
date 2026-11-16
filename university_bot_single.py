@@ -343,6 +343,12 @@ def init_db():
                 _supa_select(table, limit=1)
             except Exception:
                 missing.append(table)
+        with _DIAG_LOCK:
+            DIAG["storage_ok"] = not missing
+            if missing:
+                DIAG["storage_note"] = "جداول ناقصة: " + ", ".join(missing)
+            else:
+                DIAG["storage_note"] = "الاتصال سليم والبيانات محفوظة دائمًا"
         if missing:
             print("[supabase] ⚠️ جداول مفقودة:", ", ".join(missing))
             print("[supabase] افتح Supabase → SQL Editor والصق محتوى "
@@ -355,6 +361,9 @@ def init_db():
 
     with _connect() as con:
         con.executescript(SCHEMA_SQLITE)
+    with _DIAG_LOCK:
+        DIAG["storage_ok"] = None
+        DIAG["storage_note"] = "تخزين مؤقت — يُمسح عند إعادة تشغيل الخدمة"
     print("[sqlite] ✅ قاعدة البيانات المحلية جاهزة")
 
 
@@ -616,6 +625,8 @@ DIAG = {
     "webhook_url": None,
     "pending_count": None,
     "last_webhook_error": None,
+    "storage_ok": None,
+    "storage_note": None,
 }
 _DIAG_LOCK = threading.Lock()
 
@@ -1343,6 +1354,8 @@ def status_page():
                 + color + "'>" + str(value) + "</td></tr>")
 
     rows = [
+        row('نوع التخزين', storage_label(), USE_SUPABASE),
+        row('فحص قاعدة البيانات', d.get('storage_note') or 'قيد الفحص', d.get('storage_ok')),
         row('وقت التشغيل', d.get('started_at') or '-'),
         row('وضع العمل', d.get('mode') or '-'),
         row('حالة التوكن', d.get('token_message') or 'قيد الفحص', d.get('token_ok')),
@@ -1358,7 +1371,15 @@ def status_page():
             d.get('last_reply_ok')),
     ]
 
-    if d.get('token_ok') is False:
+    if d.get('storage_ok') is False:
+        cls = 'bad'
+        tip = ('قاعدة البيانات السحابية (Supabase) متصلة لكن جداولها ناقصة: '
+               + str(d.get('storage_note') or '') + '. افتح Supabase ← SQL Editor '
+               'والصق كود إنشاء الجداول مرة واحدة ثم أعد التشغيل.')
+    elif USE_SUPABASE and d.get('storage_ok') is True:
+        cls = 'good'
+        tip = 'البوت متصل بقاعدة Supabase — بياناتك محفوظة للأبد ولن تُفقد عند إعادة التشغيل.'
+    elif d.get('token_ok') is False:
         cls = 'bad'
         tip = ('السبب الأرجح لتوقف الرد: التوكن غير صالح. افتح @BotFather ← /revoke'
                ' ← اختر بوتك ← انسخ التوكن الجديد ← Render ← Environment'
