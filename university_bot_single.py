@@ -18,6 +18,7 @@
 """
 
 import html
+import io
 import json
 import os
 import re
@@ -41,13 +42,14 @@ DB_PATH = os.getenv(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "bot.db"),
 )
 
-TABLES = ("settings", "year_groups", "specializations", "courses")
+TABLES = ("settings", "year_groups", "specializations", "courses", "students")
 # عمود المفتاح الأساسي لكل جدول (يُستخدم للتفريغ الكامل عبر REST)
 PK = {
     "settings": "key",
     "year_groups": "year",
     "specializations": "id",
     "courses": "id",
+    "students": "id",
 }
 
 SCHEMA_SQLITE = """
@@ -77,10 +79,27 @@ SCHEMA_SQLITE = """
         practical TEXT NOT NULL DEFAULT '',
         courses   TEXT NOT NULL DEFAULT '',
         files     TEXT NOT NULL DEFAULT '',
+        theory    TEXT NOT NULL DEFAULT '',
+        labs      TEXT NOT NULL DEFAULT '',
+        past      TEXT NOT NULL DEFAULT '',
         position  INTEGER NOT NULL DEFAULT 0
     );
 
+    CREATE TABLE IF NOT EXISTS students (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id    TEXT NOT NULL DEFAULT '',
+        chat_id    TEXT NOT NULL DEFAULT '',
+        full_name  TEXT NOT NULL DEFAULT '',
+        uni_id     TEXT NOT NULL DEFAULT '',
+        year       INTEGER NOT NULL DEFAULT 0,
+        spec_id    INTEGER,
+        username   TEXT NOT NULL DEFAULT '',
+        joined_at  TEXT NOT NULL DEFAULT '',
+        updated_at TEXT NOT NULL DEFAULT ''
+    );
+
     CREATE INDEX IF NOT EXISTS idx_courses_year ON courses(year, spec_id);
+    CREATE INDEX IF NOT EXISTS idx_students_uid ON students(user_id);
 """
 
 
@@ -127,6 +146,46 @@ def _where_sql(filters):
             clauses.append("%s = ?" % col)
             values.append(val)
     return (" WHERE " + " AND ".join(clauses)) if clauses else "", values
+
+
+# أعمدة أُضيفت لاحقًا: تُضاف تلقائيًا لقواعد البيانات القديمة بلا فقدان بيانات
+_MIGRATE_COLUMNS = {
+    "courses": [
+        ("theory", "TEXT NOT NULL DEFAULT ''"),
+        ("labs", "TEXT NOT NULL DEFAULT ''"),
+        ("past", "TEXT NOT NULL DEFAULT ''"),
+    ],
+    "students": [
+        ("user_id", "TEXT NOT NULL DEFAULT ''"),
+        ("chat_id", "TEXT NOT NULL DEFAULT ''"),
+        ("full_name", "TEXT NOT NULL DEFAULT ''"),
+        ("uni_id", "TEXT NOT NULL DEFAULT ''"),
+        ("year", "INTEGER NOT NULL DEFAULT 0"),
+        ("spec_id", "INTEGER"),
+        ("username", "TEXT NOT NULL DEFAULT ''"),
+        ("joined_at", "TEXT NOT NULL DEFAULT ''"),
+        ("updated_at", "TEXT NOT NULL DEFAULT ''"),
+    ],
+}
+
+
+def _lite_migrate():
+    """يضيف أي عمود ناقص في قاعدة قديمة — آمن ويتجاهل الأخطاء."""
+    with _connect() as con:
+        for table, cols in _MIGRATE_COLUMNS.items():
+            try:
+                have = {r["name"] for r in con.execute("PRAGMA table_info(%s)" % table)}
+            except Exception:
+                continue
+            if not have:
+                continue
+            for name, decl in cols:
+                if name in have:
+                    continue
+                try:
+                    con.execute("ALTER TABLE %s ADD COLUMN %s %s" % (table, name, decl))
+                except Exception as exc:
+                    print("[migrate skip]", table, name, exc)
 
 
 def _lite_select(table, filters=None, order=None, limit=None):
@@ -361,6 +420,7 @@ def init_db():
 
     with _connect() as con:
         con.executescript(SCHEMA_SQLITE)
+    _lite_migrate()
     with _DIAG_LOCK:
         DIAG["storage_ok"] = None
         DIAG["storage_note"] = "تخزين مؤقت — يُمسح عند إعادة تشغيل الخدمة"
@@ -449,11 +509,75 @@ def add_course(year, spec_id, name, **fields):
         "practical": fields.get("practical", ""),
         "courses": fields.get("courses", ""),
         "files": fields.get("files", ""),
+        "theory": fields.get("theory", ""),
+        "labs": fields.get("labs", ""),
+        "past": fields.get("past", ""),
         "position": 0,
     }
     out = _insert("courses", row)
     _cache_clear()
     return out.get("id")
+
+
+# ------------------------------------------------------------------ students
+def _now():
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def get_student(user_id):
+    rows = _select("students", {"user_id": str(user_id)}, limit=1)
+    return rows[0] if rows else None
+
+
+def upsert_student(user_id, chat_id="", **fields):
+    """ينشئ سجل الطالب أو يحدّثه — الشكل الوحيد الآمن في الوضعين."""
+    row = {"user_id": str(user_id)}
+    existing = get_student(user_id)
+    if fields.get("full_name") is not None:
+        row["full_name"] = (fields.get("full_name") or "")[:64]
+    if fields.get("uni_id") is not None:
+        row["uni_id"] = (fields.get("uni_id") or "")[:24]
+    if fields.get("year") is not None:
+        try:
+            row["year"] = int(fields.get("year") or 0)
+        except Exception:
+            row["year"] = 0
+    if fields.get("spec_id") is not None:
+        row["spec_id"] = fields.get("spec_id")
+    if fields.get("username") is not None:
+        row["username"] = (fields.get("username") or "")[:64]
+    if chat_id:
+        row["chat_id"] = str(chat_id)
+    row["updated_at"] = _now()
+    if existing is None:
+        row["joined_at"] = _now()
+        _insert("students", row)
+    else:
+        _update("students", {"user_id": str(user_id)}, row)
+    _cache_clear()
+    return get_student(user_id)
+
+
+def list_students(limit=None):
+    return _select("students", order=[("id", "asc")], limit=limit)
+
+
+def count_students():
+    try:
+        return len(_select("students", limit=1000))
+    except Exception:
+        return 0
+
+
+def all_chat_ids():
+    """معرّفات المحادثات لإرسال البث — بلا تكرار ومرتّبة."""
+    ids, seen = [], set()
+    for s in list_students():
+        cid = str(s.get("chat_id") or "").strip()
+        if cid and cid not in seen:
+            seen.add(cid)
+            ids.append(cid)
+    return ids
 
 
 def update_course(course_id, **fields):
@@ -479,6 +603,7 @@ def export_data():
         "specializations": _select("specializations",
                                    order=[("position", "asc"), ("id", "asc")]),
         "courses": _select("courses", order=[("position", "asc"), ("id", "asc")]),
+        "students": _select("students", order=[("id", "asc")]),
     }
 
 
@@ -522,6 +647,9 @@ def import_data(payload):
             "practical": c.get("practical", ""),
             "courses": c.get("courses", ""),
             "files": c.get("files", ""),
+            "theory": c.get("theory", ""),
+            "labs": c.get("labs", ""),
+            "past": c.get("past", ""),
             "position": c.get("position", 0),
         })
     _insert_many("courses", new_courses)
@@ -580,6 +708,11 @@ if not WEBHOOK_PATH:
 PORT = int(os.getenv("PORT", "8080"))
 HOST = os.getenv("HOST", "0.0.0.0")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
+# هل نطلب من الطالب تسجيل بياناته (الاسم + الرقم الجامعي) عند أول استخدام؟
+ASK_STUDENT_DATA = (os.getenv("ASK_STUDENT_DATA", "1").strip().lower()
+                    not in ("0", "false", "no", "off"))
+# معرّفات محادثات المشرفين (اختيارية): تُستخدم للإشعارات
+ADMIN_CHAT_IDS = {x.strip() for x in os.getenv("ADMIN_CHAT_IDS", "").split(",") if x.strip()}
 DEFAULT_ADMIN_IDS = [
     int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.strip().isdigit()
 ]
@@ -609,11 +742,16 @@ BOT_FIELDS = [
 ]
 
 COURSE_FIELDS = [
-    ("lectures", "رابط المحاضرات"),
-    ("practical", "رابط العملي"),
-    ("courses", "رابط الدورات"),
-    ("files", "رابط الملفات"),
+    ("theory", "📖 محاضرات نظرية"),
+    ("labs", "💻 مخابر عملي"),
+    ("past", "📝 دورات سابقة"),
+    ("lectures", "🎧 تسجيلات المحاضرات"),
+    ("practical", "🧪 مواد العملي"),
+    ("courses", "🗂 دورات ومراجع"),
+    ("files", "📎 ملفات المقرر"),
 ]
+# التصنيفات الأساسية الثلاثة التي يراها الطالب إن وُجدت
+COURSE_MAIN_FIELDS = ("theory", "labs", "past")
 
 # الذاكرة المؤقتة: من ينتظر إدخال قيمة، وماذا ينتظر بالضبط
 PENDING = {}
@@ -637,6 +775,8 @@ DIAG = {
     "storage_ok": None,
     "storage_note": None,
     "last_db_error": None,
+    "students": 0,
+    "broadcast_sent": 0,
 }
 _DIAG_LOCK = threading.Lock()
 
@@ -765,6 +905,139 @@ def send_json_file(chat_id, filename, payload, caption=""):
         return {"ok": False}
 
 
+def send_bytes_file(chat_id, filename, blob, caption="", mime="text/csv"):
+    """يرسل أي ملف (نص/بايتات) كوثيقة تلغرام — للتقارير وملفات Excel."""
+    if isinstance(blob, str):
+        blob = blob.encode("utf-8-sig")
+    boundary = "----uniguide" + str(int(time.time() * 1000))
+    parts = []
+
+    def field(name, value):
+        parts.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n'
+            f"{value}\r\n".encode("utf-8"))
+
+    field("chat_id", chat_id)
+    if caption:
+        field("caption", caption)
+        field("parse_mode", "HTML")
+    parts.append(
+        f'--{boundary}\r\nContent-Disposition: form-data; name="document"; '
+        f'filename="{filename}"\r\nContent-Type: {mime}\r\n\r\n'.encode("utf-8"))
+    parts.append(blob if isinstance(blob, bytes) else blob.encode("utf-8"))
+    parts.append(f"\r\n--{boundary}--\r\n".encode("utf-8"))
+    body = b"".join(parts)
+
+    url = API.format(token=BOT_TOKEN, method="sendDocument")
+    req = urllib.request.Request(
+        url, data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    try:
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:  # pragma: no cover
+        print("[sendDocument error]", exc)
+        return {"ok": False}
+
+
+def _xlsx_escape(value):
+    text = "" if value is None else str(value)
+    return (text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                .replace('"', "&quot;"))
+
+
+def make_xlsx(sheet_name, header, rows):
+    """يبني ملف Excel (.xlsx) حقيقيًا بلا أي مكتبات خارجية.
+
+    نكتب ملفات XML الأساسية داخل حاوية ZIP — وهو ما يقرأه Excel مباشرة."""
+    import zipfile
+
+    def col_letter(n):
+        s = ""
+        n += 1
+        while n:
+            n, r = divmod(n - 1, 26)
+            s = chr(65 + r) + s
+        return s
+
+    def sheet_xml():
+        out = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+               '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">',
+               "<sheetData>"]
+        all_rows = [header] + rows
+        for ri, row in enumerate(all_rows, 1):
+            out.append('<row r="%d">' % ri)
+            for ci, val in enumerate(row):
+                ref = "%s%d" % (col_letter(ci), ri)
+                if isinstance(val, (int, float)) and not isinstance(val, bool):
+                    out.append('<c r="%s"><v>%s</v></c>' % (ref, val))
+                else:
+                    out.append('<c r="%s" t="inlineStr"><is><t xml:space="preserve">%s</t></is></c>'
+                               % (ref, _xlsx_escape(val)))
+            out.append("</row>")
+        out.append("</sheetData></worksheet>")
+        return "".join(out)
+
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        "</Types>")
+    root_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+        "</Relationships>")
+    workbook = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        '<sheets><sheet name="%s" sheetId="1" r:id="rId1"/></sheets></workbook>'
+        % _xlsx_escape(sheet_name[:28] or "Sheet1"))
+    wb_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+        "</Relationships>")
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", content_types)
+        z.writestr("_rels/.rels", root_rels)
+        z.writestr("xl/workbook.xml", workbook)
+        z.writestr("xl/_rels/workbook.xml.rels", wb_rels)
+        z.writestr("xl/worksheets/sheet1.xml", sheet_xml())
+    return buf.getvalue()
+
+
+def csv_text(header, rows):
+    """نص CSV بترميز يفهمه Excel العربي (BOM داخليًا)."""
+    import csv
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow([str(h) for h in header])
+    for r in rows:
+        w.writerow(["" if v is None else str(v) for v in r])
+    return buf.getvalue()
+
+
+def notify_admins(text, keyboard=None):
+    """إشعار فوري لكل المشرفين المعروفين."""
+    targets = set(DEFAULT_ADMIN_IDS) | set(ADMIN_STATE)
+    for s in db.list_students(limit=500):
+        if str(s.get("chat_id") or "") in ADMIN_CHAT_IDS:
+            targets.add(int(s["chat_id"]) if str(s["chat_id"]).isdigit() else s["chat_id"])
+    for cid in targets:
+        try:
+            send(cid, text, keyboard)
+        except Exception as exc:  # pragma: no cover
+            print("[notify warning]", exc)
+
+
 def download_file(file_id):
     """ينزّل ملفًا من تلغرام ويرجع محتواه بايتات."""
     info = api("getFile", file_id=file_id)
@@ -828,23 +1101,61 @@ def links_block(pairs):
 DIVIDER = "━━━━━━━━━━━━━━━"
 
 
-def main_menu():
-    """القائمة الرئيسية — العنوان والترحيب والتذييل كلها قابلة للتعديل."""
+# ------------------------------------------------------------------ breadcrumb
+HOME_CRUMB = "📍 الرئيسية"
+
+
+def crumbs(*parts):
+    """شريط مسار بصري: 📍 الرئيسية › السنة الثالثة › تخصص المحاسبة
+
+    يوضح للطالب مكانه الحالي في أي شاشة عميقة."""
+    items = [HOME_CRUMB] + [str(p).strip() for p in parts if str(p or "").strip()]
+    return "🧭 <i>" + " › ".join(items) + "</i>"
+
+
+def home_button(label="🏠 القائمة الرئيسية", data="menu"):
+    return btn(label, data)
+
+
+def go_home_row(label="🏠 القائمة الرئيسية"):
+    """صف ثابت يظهر آخر كل قائمة عميقة: عودة بضغطة واحدة للرئيسية."""
+    return [home_button(label)]
+
+
+def grid(buttons, per_row=2):
+    """يرتّب الأزرار في شبكة أنيقة (2×2 افتراضيًا) مريحة من الهاتف."""
+    return [list(buttons[i:i + per_row]) for i in range(0, len(buttons), per_row)]
+
+
+def main_menu(uid=None):
+    """القائمة الرئيسية — أزرار مرتّبة في شبكة 2×2 مريحة من الهاتف."""
     title = db.get_setting("bot_title") or db.get_setting("university_name") or "المرشد الجامعي"
     subtitle = db.get_setting("bot_subtitle") or "مرحبًا بك! اختر القسم الذي تريده 👇"
-    parts = ["🎓 <b>" + esc(title) + "</b>", DIVIDER, esc(subtitle)]
+    student = db.get_student(uid) if uid else None
+
+    parts = ["🎓 <b>" + esc(title) + "</b>", DIVIDER]
+    if student and student.get("full_name"):
+        parts.append("👋 أهلًا " + esc(student["full_name"]) +
+                     (" • " + esc(student.get("uni_id")) if student.get("uni_id") else ""))
+    parts.append(esc(subtitle))
     text = "\n".join(parts)
     footer = db.get_setting("footer_text")
     if footer:
         text += "\n\n" + esc(footer)
 
-    rows = [
-        [btn("📢 المعلومات العامة والتعاميم", "gen")],
-        [btn("📅 الجداول الدراسية والامتحانية", "sched")],
-        [btn("📘 السنة الأولى", "y:1"), btn("📗 السنة الثانية", "y:2")],
-        [btn("📙 السنة الثالثة", "y:3"), btn("📕 السنة الرابعة", "y:4")],
-        [btn("🔎 بحث عن مقرر", "search")],
+    # (1) شبكة 2×2 للأقسام الأساسية — كل صف زرّان متساويان
+    grid_buttons = [
+        btn("📢 المعلومات العامة", "gen"),
+        btn("📅 الجداول الدراسية", "sched"),
+        btn("📘 السنة الأولى", "y:1"),
+        btn("📗 السنة الثانية", "y:2"),
+        btn("📙 السنة الثالثة", "y:3"),
+        btn("📕 السنة الرابعة", "y:4"),
     ]
+    rows = grid(grid_buttons, 2)
+    # (2) أدوات: البحث والإعدادات جنبًا إلى جنب
+    rows.append([btn("🔎 بحث عن مقرر", "search"), btn("⚙️ إعداداتي", "me")])
+    # (3) التواصل (يظهران فقط إن أضاف المشرف روابطهما)
     extra = []
     if db.get_setting("contact_link"):
         extra.append(btn("📞 تواصل معنا", "contact"))
@@ -857,7 +1168,7 @@ def main_menu():
 
 def contact_screen():
     """شاشة التواصل والقناة."""
-    lines = ["📞 <b>تواصل معنا</b>", DIVIDER, ""]
+    lines = [crumbs("تواصل معنا"), "📞 <b>تواصل معنا</b>", DIVIDER, ""]
     contact = db.get_setting("contact_link")
     channel = db.get_setting("channel_link")
     found = False
@@ -869,38 +1180,42 @@ def contact_screen():
         found = True
     if not found:
         lines.append("⚠️ لم تُضَف أي وسيلة تواصل بعد.")
-    return "\n".join(lines), {"inline_keyboard": [[btn("📣 القناة الرسمية", "channel")],
-                                                  [btn("⬅️ رجوع", "menu")]]}
+    rows = [[btn("📣 القناة الرسمية", "channel")], go_home_row()]
+    return "\n".join(lines), {"inline_keyboard": rows}
 
 
 def channel_screen():
-    lines = ["📣 <b>القناة الرسمية</b>", DIVIDER, ""]
+    lines = [crumbs("القناة الرسمية"), "📣 <b>القناة الرسمية</b>", DIVIDER, ""]
     channel = db.get_setting("channel_link")
     if channel:
         lines.append("<a href='" + esc(channel) + "'>اضغط للانضمام إلى القناة</a>")
     else:
         lines.append("⚠️ لم يُضَف رابط القناة بعد.")
-    return "\n".join(lines), {"inline_keyboard": [[btn("⬅️ رجوع", "menu")]]}
+    return "\n".join(lines), {"inline_keyboard": [go_home_row()]}
 
 
 def general_screen():
-    lines = ["📢 <b>المعلومات العامة والتعاميم</b>", DIVIDER, ""]
+    lines = [crumbs("المعلومات العامة"), "📢 <b>المعلومات العامة والتعاميم</b>", DIVIDER, ""]
     body = links_block([(label, db.get_setting(key)) for key, label in GENERAL_FIELDS])
     lines.append(body if body else "⚠️ لم تُضَف أي معلومات بعد.")
-    kb = {"inline_keyboard": [[btn("⬅️ رجوع", "menu")]]}
-    return "\n".join(lines), kb
+    return "\n".join(lines), {"inline_keyboard": [go_home_row()]}
 
 
 def schedule_screen():
-    lines = ["📅 <b>الجداول الدراسية والامتحانية</b>", DIVIDER, ""]
+    """الجداول الدراسية والامتحانية: محاضرات، قاعات، امتحانات."""
+    lines = [crumbs("الجداول الدراسية والامتحانية"),
+             "📅 <b>الجداول الدراسية والامتحانية</b>", DIVIDER, "",
+             "<i>كل الجداول الرسمية في مكان واحد:</i>", ""]
     body = links_block([(label, db.get_setting(key)) for key, label in SCHEDULE_FIELDS])
     lines.append(body if body else "⚠️ لم تُضَف أي جداول بعد.")
-    kb = {"inline_keyboard": [[btn("⬅️ رجوع", "menu")]]}
-    return "\n".join(lines), kb
+    lines.append("")
+    lines.append("💡 <i>لمتابعة أي تحديث على الجداول، انضم إلى قناة الكلية أو قناة سنتك.</i>")
+    return "\n".join(lines), {"inline_keyboard": [go_home_row()]}
 
 
 def year_screen(year):
-    lines = ["<b>" + YEAR_TITLES[year] + "</b>", DIVIDER, ""]
+    """شاشة السنة: مقرراتها (أو تخصصاتها في السنة الثالثة) + عودة سريعة."""
+    lines = [crumbs(YEAR_TITLES[year]), "<b>" + YEAR_TITLES[year] + "</b>", DIVIDER, ""]
     group = db.get_year_group(year)
     if group:
         lines.append(f"👥 <a href='{esc(group)}'>رابط مجموعة السنة</a>")
@@ -912,10 +1227,12 @@ def year_screen(year):
         specs = db.list_specs()
         if not specs:
             lines.append("⚠️ لم تُضَف تخصصات بعد.")
-            return "\n".join(lines), {"inline_keyboard": [[btn("⬅️ رجوع", "menu")]]}
-        lines.append("🎯 <b>التخصصات:</b> اختر تخصصك لعرض مقرراته")
+            return "\n".join(lines), {"inline_keyboard": [go_home_row()]}
+        lines.append("🎯 <b>التخصصات المتاحة:</b>")
+        lines.append("<i>اضغط على تخصصك ليظهر لك مقرراته فقط.</i>")
+        # كل تخصص في سطر مستقل — لا تُخلط المقررات هنا أبدًا
         rows = [[btn(f"🎯 {s['name']}", f"sp:{s['id']}")] for s in specs]
-        rows.append([btn("⬅️ رجوع", "menu")])
+        rows.append(go_home_row())
         return "\n".join(lines), {"inline_keyboard": rows}
 
     courses = db.list_courses(year)
@@ -926,64 +1243,218 @@ def year_screen(year):
         for i, c in enumerate(courses, 1):
             lines.append(f"{i}. {esc(c['name'])}")
     rows = [[btn(f"📖 {c['name']}", f"c:{c['id']}")] for c in courses]
-    rows.append([btn("⬅️ رجوع", "menu")])
+    rows.append(go_home_row())
     return "\n".join(lines), {"inline_keyboard": rows}
 
 
 def spec_screen(spec_id):
     spec = db.get_spec(spec_id)
     if not spec:
-        return "⚠️ التخصص غير موجود.", {"inline_keyboard": [[btn("⬅️ رجوع", "menu")]]}
-    lines = ["🎯 <b>" + esc(spec["name"]) + "</b>", DIVIDER, ""]
+        return "⚠️ التخصص غير موجود.", {"inline_keyboard": [go_home_row()]}
+    lines = [crumbs(YEAR_TITLES[3], "تخصص: " + spec["name"]),
+             "🎯 <b>" + esc(spec["name"]) + "</b>", DIVIDER, ""]
     if spec["group_link"]:
         lines.append(f"👥 <a href='{esc(spec['group_link'])}'>رابط مجموعة التخصص</a>")
     else:
         lines.append("👥 رابط مجموعة التخصص: غير متوفر")
-    lines.append("\n📚 <b>مقررات التخصص:</b>")
-    courses = db.list_courses(3, spec_id)
+    lines.append("")
+    lines.append("📚 <b>مقررات تخصص «" + esc(spec["name"]) + "»:</b>")
+    courses = db.list_courses(3, spec_id)   # مقررات هذا التخصص فقط
     if not courses:
-        lines.append("⚠️ لم تُضَف مقررات بعد.")
+        lines.append("<i>لم تُضَف مقررات لهذا التخصص بعد.</i>")
     else:
         for i, c in enumerate(courses, 1):
             lines.append(f"{i}. {esc(c['name'])}")
     rows = [[btn(f"📖 {c['name']}", f"c:{c['id']}")] for c in courses]
-    rows.append([btn("⬅️ رجوع", "y:3")])
+    rows.append(go_home_row())
     return "\n".join(lines), {"inline_keyboard": rows}
 
 
 def course_screen(course_id):
+    """شاشة المقرر بتصنيفات أدق: نظري / عملي / دورات سابقة / ملفات."""
     c = db.get_course(course_id)
     if not c:
-        return "⚠️ المقرر غير موجود.", {"inline_keyboard": [[btn("⬅️ رجوع", "menu")]]}
-    lines = ["📖 <b>" + esc(c["name"]) + "</b>", DIVIDER, ""]
-    if c["spec_id"]:
+        return "⚠️ المقرر غير موجود.", {"inline_keyboard": [go_home_row()]}
+    spec_name = None
+    if c.get("spec_id"):
         spec = db.get_spec(c["spec_id"])
-        lines.append(f"🎯 التخصص: {esc(spec['name']) if spec else '-'}")
-    else:
-        lines.append(f"🗓 {YEAR_TITLES.get(c['year'], '-')}")
+        spec_name = spec["name"] if spec else None
+    path = [YEAR_TITLES.get(c["year"], "-")]
+    if spec_name:
+        path.append("تخصص: " + spec_name)
+    lines = [crumbs(*path), "📖 <b>" + esc(c["name"]) + "</b>", DIVIDER]
+    if spec_name:
+        lines.append(f"🎯 التخصص: {esc(spec_name)}")
     lines.append("")
-    body = links_block([(label, c[key]) for key, label in COURSE_FIELDS])
-    lines.append(body if body else "⚠️ لم تُضَف روابط لهذا المقرر بعد.")
-    back = f"sp:{c['spec_id']}" if c["spec_id"] else f"y:{c['year']}"
-    return "\n".join(lines), {"inline_keyboard": [[btn("⬅️ رجوع", back)]]}
+
+    # التصنيفات الأساسية الثلاثة: تظهر بأيقونة واضحة
+    lines.append("<b>اختر ما تريد من هذا المقرر:</b>")
+    found_any = False
+    for key, label in COURSE_FIELDS:
+        val = (c.get(key) or "").strip()
+        if val:
+            found_any = True
+            lines.append(f"▫️ {esc(label)}: <a href='{esc(val)}'>اضغط هنا</a>")
+    if not found_any:
+        lines.append("<i>⚠️ لم تُضَف ملفات لهذا المقرر بعد.</i>")
+
+    rows = []
+    for key, label in COURSE_FIELDS:
+        if (c.get(key) or "").strip():
+            rows.append([btn(label, f"f:{course_id}:{key}")])
+    rows.append([btn("⬅️ رجوع إلى المقررات", f"y:{c['year']}" if not c.get("spec_id") else f"sp:{c['spec_id']}")])
+    rows.append(go_home_row())
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def course_file_screen(course_id, field):
+    """يفتح رابط ملف المقرر داخل تلغرام، مع بقاء التنقّل واضحًا."""
+    c = db.get_course(course_id)
+    label = dict(COURSE_FIELDS).get(field, "الملف")
+    if not c or not (c.get(field) or "").strip():
+        return "⚠️ هذا الملف غير متوفر حاليًا.", {"inline_keyboard": [go_home_row()]}
+    path = [YEAR_TITLES.get(c["year"], "-")]
+    if c.get("spec_id"):
+        spec = db.get_spec(c["spec_id"])
+        if spec:
+            path.append("تخصص: " + spec["name"])
+    path.append(c["name"])
+    lines = [crumbs(*path), "🔗 <b>" + esc(label) + "</b>", DIVIDER, "",
+             "📖 المقرر: <b>" + esc(c["name"]) + "</b>", "",
+             "<a href='" + esc(c[field]) + "'>اضغط هنا لفتح الملف</a>"]
+    rows = [[btn("⬅️ رجوع إلى المقرر", f"c:{course_id}")], go_home_row()]
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+# ------------------------------------------------------- إعدادات الطالب
+def me_screen(uid):
+    """ملف الطالب الشخصي: تعديل الاسم والرقم الجامعي بنفسه."""
+    s = db.get_student(uid) or {}
+    lines = [crumbs("إعداداتي"), "⚙️ <b>إعداداتي</b>", DIVIDER, ""]
+    lines.append("• الاسم: <b>" + (esc(s.get("full_name")) or "— لم يُسجَّل —") + "</b>")
+    lines.append("• الرقم الجامعي: <b>" + (esc(s.get("uni_id")) or "— لم يُسجَّل —") + "</b>")
+    if s.get("year"):
+        lines.append("• السنة: <b>" + esc(YEAR_TITLES.get(s.get("year"), s.get("year"))) + "</b>")
+    lines.append("")
+    lines.append("<i>أي تعديل تحفظه هنا يصل إشعار فوري لإدارة الكلية ✅</i>")
+    rows = []
+    if not (s.get("full_name") and s.get("uni_id")):
+        rows.append([btn("📝 إكمال بياناتي (الاسم + الرقم)", "me:reg")])
+    rows += [
+        [btn("✏️ تعديل الاسم", "me:name"), btn("🔢 تعديل الرقم الجامعي", "me:uni")],
+        [btn("🎓 تعديل السنة", "me:year")],
+        go_home_row(),
+    ]
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def me_year_screen(uid):
+    s = db.get_student(uid) or {}
+    lines = [crumbs("إعداداتي", "تعديل السنة"), "🎓 <b>اختر سنتك الدراسية</b>", DIVIDER, ""]
+    rows = [[btn(YEAR_TITLES[y], f"me:setyear:{y}")] for y in YEARS]
+    rows.append([btn("⬅️ رجوع", "me")])
+    rows.append(go_home_row())
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def valid_uni_id(value):
+    """تحقق الرقم الجامعي: أرقام فقط، من 4 إلى 20 خانة (يمنع الإدخال العشوائي)."""
+    v = (value or "").strip()
+    if not re.fullmatch(r"[0-9]{4,20}", v):
+        return False, ("الرقم الجامعي يجب أن يكون <b>أرقامًا فقط</b> "
+                       "وطوله من 4 إلى 20 رقمًا.")
+    return True, v
+
+
+def valid_name(value):
+    """تحقق الاسم: حروف عربية/إنجليزية ومسافات فقط، بلا أرقام أو رموز."""
+    v = " ".join((value or "").split())          # تنظيف المسافات الزائدة
+    if len(v) < 2:
+        return False, "الاسم قصير جدًا، اكتب اسمك كما في السجل الجامعي."
+    if len(v) > 64:
+        return False, "الاسم طويل جدًا، اكتب اسمك الثلاثي فقط."
+    # لا أرقام ولا رموز: حروف عربية أو إنجليزية (مع الهمزات والتشديد) والمسافة
+    if not re.fullmatch(r"[\u0621-\u064A\u0660-\u0669a-zA-Z \u0629\u0649\u0640\u0671-\u06D3'\-]+", v):
+        return False, "اكتب الاسم بحروف فقط (بلا أرقام أو رموز)."
+    if re.search(r"[0-9\u0660-\u0669]", v):
+        return False, "الاسم لا يحتوي أرقامًا — الأرقام للرقم الجامعي فقط."
+    if not re.search(r"[a-zA-Z\u0621-\u064A]", v):
+        return False, "اكتب اسمك بحروف واضحة."
+    if len(re.sub(r"[^a-zA-Z\u0621-\u064A]", "", v)) < 2:
+        return False, "الاسم قصير جدًا، اكتب اسمك كما في السجل الجامعي."
+    return True, v[:64]
 
 
 # ---------------------------------------------------------------- admin panel
 def admin_menu():
-    text = "🛠 <b>لوحة التحكم</b>\n\nاختر ما تريد تعديله:"
+    text = ("🛠 <b>لوحة التحكم</b>\n" + DIVIDER
+            + "\nاختر ما تريد إدارته:")
     kb = {
         "inline_keyboard": [
+            # المحتوى (شبكة 2×2)
             [btn("📢 المعلومات العامة", "a:gen"), btn("📅 الجداول", "a:sched")],
             [btn("📘 الأولى", "a:y:1"), btn("📗 الثانية", "a:y:2")],
             [btn("📙 الثالثة", "a:y:3"), btn("📕 الرابعة", "a:y:4")],
-            [btn("🎯 إدارة التخصصات", "a:specs")],
+            # التخصصات والطلاب
+            [btn("🎯 إدارة التخصصات", "a:specs"), btn("👥 الطلاب", "a:students")],
+            # التعاميم والتقارير
+            [btn("📣 بث عام", "a:bc"), btn("📤 تصدير البيانات", "a:export")],
+            # المظهر والنسخ
             [btn("🎨 مظهر البوت واسمه", "a:bot")],
             [btn("💾 نسخة احتياطية", "a:backup"), btn("📥 استعادة نسخة", "a:restore")],
+            # الأدوات
             [btn("🔍 فحص التخزين", "a:testdb"), btn("🩺 حالة البوت", "a:status")],
-            [btn("👁 معاينة البوت", "menu")],
+            [btn("🏠 القائمة الرئيسية", "menu")],
         ]
     }
     return text, kb
+
+
+def admin_students_screen():
+    """قائمة الطلاب المسجّلين مع ملخّص سريع."""
+    students = db.list_students(limit=300)
+    lines = ["👥 <b>بيانات الطلاب</b>", DIVIDER, "",
+             "عدد الطلاب المسجّلين: <b>" + str(len(students)) + "</b>", ""]
+    if not students:
+        lines.append("لا يوجد طلاب مسجّلون بعد.")
+    else:
+        for i, s in enumerate(students[:25], 1):
+            nm = esc(s.get("full_name") or "—")
+            un = esc(s.get("uni_id") or "—")
+            yr = YEAR_TITLES.get(s.get("year"), "") if s.get("year") else ""
+            lines.append(f"{i}. {nm} • <code>{un}</code>" + (" • " + esc(yr) if yr else ""))
+        if len(students) > 25:
+            lines.append(f"\n<i>… و{len(students) - 25} طالبًا آخر — استخدم التصدير لرؤيتهم كلهم.</i>")
+    rows = [
+        [btn("📊 تصدير Excel", "a:export:xlsx"), btn("📄 تصدير CSV", "a:export:csv")],
+        [btn("📣 بث عام للجميع", "a:bc")],
+        [btn("⬅️ رجوع", "a:menu"), btn("🏠 الرئيسية", "menu")],
+    ]
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def admin_broadcast_screen():
+    lines = ["📣 <b>بث عام</b>", DIVIDER, "",
+             "أرسل رسالة تصل إلى <b>كل الطلاب المسجّلين</b>.", "",
+             "• يمكنك استخدام التنسيق: <b>عريض</b> و <i>مائل</i>.", ""]
+    n = len(db.all_chat_ids())
+    lines.append("عدد المستلمين الآن: <b>" + str(n) + "</b>")
+    if n == 0:
+        lines.append("\n⚠️ لا يوجد مستلمون بعد — سيُسجَّل الطلاب عند أول استخدام للبوت.")
+    rows = [[btn("✍️ كتابة البث وإرساله", "a:bcwrite")],
+            [btn("⬅️ رجوع", "a:menu"), btn("🏠 الرئيسية", "menu")]]
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def admin_export_screen():
+    lines = ["📤 <b>تصدير البيانات</b>", DIVIDER, "",
+             "اختر الصيغة التي تريدها:", "",
+             "• <b>Excel</b> — ملف جاهز يفتح على الجوال مباشرة.", 
+             "• <b>CSV</b> — لتشغيله على أي برنامج جداول.", ""]
+    lines.append("عدد الطلاب: <b>" + str(db.count_students()) + "</b>")
+    rows = [[btn("📊 Excel", "a:export:xlsx"), btn("📄 CSV", "a:export:csv")],
+            [btn("⬅️ رجوع", "a:menu"), btn("🏠 الرئيسية", "menu")]]
+    return "\n".join(lines), {"inline_keyboard": rows}
 
 
 def admin_bot_screen():
@@ -1031,9 +1502,14 @@ def admin_sched_screen():
 def admin_year_screen(year):
     rows = [[btn("🔗 تعديل رابط مجموعة السنة", f"a:setyg:{year}")]]
     if year == 3:
-        for s in db.list_specs():
-            rows.append([btn(f"🎯 {s['name']}", f"a:asp:{s['id']}")])
         rows.append([btn("➕ إضافة تخصص", "a:addsp")])
+        specs = db.list_specs()
+        for s in specs:
+            rows.append([btn(f"🎯 {s['name']}", f"a:asp:{s['id']}")])
+        # مقررات بلا تخصص: كانت مخفية تمامًا عن الطلاب — نُظهرها للمشرف ليصلحها
+        orphans = [c for c in db.list_courses(3) if not c.get("spec_id")]
+        for c in orphans:
+            rows.append([btn(f"⚠️ {c['name']} (بلا تخصص)", f"a:ac:{c['id']}")])
     else:
         for c in db.list_courses(year):
             rows.append([btn(f"📖 {c['name']}", f"a:ac:{c['id']}")])
@@ -1073,13 +1549,29 @@ def admin_course_screen(course_id):
     for key, label in COURSE_FIELDS:
         lines.append(f"{label}: {esc(c[key]) or '—'}")
     back = f"a:asp:{c['spec_id']}" if c["spec_id"] else f"a:y:{c['year']}"
-    rows = [
-        [btn("✏️ الاسم", f"a:ecn:{course_id}")],
-        [btn(f"✏️ {label}", f"a:ecl:{course_id}:{key}") for key, label in COURSE_FIELDS[:2]],
-        [btn(f"✏️ {label}", f"a:ecl:{course_id}:{key}") for key, label in COURSE_FIELDS[2:]],
-        [btn("🗑 حذف المقرر", f"a:dc:{course_id}")],
-        [btn("⬅️ رجوع", back)],
-    ]
+    rows = [[btn("✏️ الاسم", f"a:ecn:{course_id}")]]
+    # كل تصنيف في سطر: 📖 نظري | 💻 مخابر | 📝 دورات سابقة | الملفات
+    for key, label in COURSE_FIELDS:
+        mark = "✅" if (c.get(key) or "").strip() else "➕"
+        rows.append([btn(f"{mark} {label}", f"a:ecl:{course_id}:{key}")])
+    # في السنة الثالثة: نقل المقرر إلى تخصص آخر (أو ربطه بتخصص إن كان بلا تخصص)
+    if c["year"] == 3 and db.list_specs():
+        rows.append([btn("🎯 نقل إلى تخصص…", f"a:mvc:{course_id}")])
+    rows.append([btn("🗑 حذف المقرر", f"a:dc:{course_id}")])
+    rows.append([btn("⬅️ رجوع", back)])
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def admin_move_course_screen(course_id):
+    """يختار المشرف التخصص الذي يُنقل إليه المقرر."""
+    c = db.get_course(course_id)
+    if not c:
+        return "⚠️ غير موجود.", {"inline_keyboard": [[btn("⬅️ رجوع", "a:menu")]]}
+    lines = ["🎯 <b>نقل المقرر إلى تخصص</b>", DIVIDER, "",
+             "المقرر: <b>" + esc(c["name"]) + "</b>", "",
+             "<i>اختر التخصص الذي ينتمي إليه هذا المقرر:</i>"]
+    rows = [[btn(f"🎯 {s['name']}", f"a:setc:{course_id}:{s['id']}")] for s in db.list_specs()]
+    rows.append([btn("⬅️ رجوع", f"a:ac:{course_id}")])
     return "\n".join(lines), {"inline_keyboard": rows}
 
 
@@ -1092,7 +1584,73 @@ def ask_for_value(chat_id, uid, action, prompt):
     )
 
 
+# ------------------------------------------- سجل مؤقت لخطوات التسجيل
+_REGISTRY = {}
+
+
+def _get_registry(uid):
+    return _REGISTRY.get(uid) or {}
+
+
+def _set_registry(uid, key, value):
+    row = _REGISTRY.setdefault(uid, {})
+    row[key] = value
+
+
+def _clear_registry(uid):
+    _REGISTRY.pop(uid, None)
+
+
+def start_registration(chat_id, uid, username=""):
+    """يبدأ تسجيل الطالب عند أول استخدام (الاسم ثم الرقم الجامعي)."""
+    _REGISTRY[uid] = {"username": username or ""}
+    PENDING[uid] = ("reg_name", None)
+    send(chat_id,
+         "👋 <b>أهلًا بك في المرشد الجامعي!</b>\n" + DIVIDER
+         + "\nقبل أن نبدأ، نسجّل بياناتك مرة واحدة فقط:\n\n"
+         + "✏️ <b>اكتب اسمك الكامل</b> كما في السجل الجامعي:",
+         {"inline_keyboard": [[btn("⏭ لاحقًا", "skipreg")]]})
+
+
 # ------------------------------------------------------------------ callbacks
+def _save_student_field(chat_id, uid, field, value):
+    """يحفظ حقلاً في ملف الطالب ثم يرسل إشعارًا فوريًا للإدارة."""
+    try:
+        old = db.get_student(uid) or {}
+        if field == "year":
+            db.upsert_student(uid, chat_id, year=value)
+            shown = YEAR_TITLES.get(value, value)
+            label = "السنة الدراسية"
+        elif field == "full_name":
+            db.upsert_student(uid, chat_id, full_name=value)
+            shown = value
+            label = "الاسم"
+        elif field == "uni_id":
+            db.upsert_student(uid, chat_id, uni_id=value)
+            shown = value
+            label = "الرقم الجامعي"
+        else:
+            return
+        with _DIAG_LOCK:
+            DIAG["students"] = db.count_students()
+        send(chat_id, f"✅ تم حفظ {label}: <b>{esc(str(shown))}</b>")
+        send(chat_id, *me_screen(uid))
+        # إشعار فوري للمشرفين بكل تعديل
+        before = old.get(field)
+        notify_admins(
+            "🔔 <b>تعديل بيانات طالب</b>\n"
+            + DIVIDER + "\n"
+            + f"👤 الطالب: {esc(old.get('full_name') or '-')}\n"
+            + f"🆔 معرّفه: <code>{uid}</code>\n"
+            + f"✏️ الحقل: {esc(label)}\n"
+            + f"↩️ قبل: {esc(str(before) or '—')}\n"
+            + f"✅ بعد: {esc(str(shown))}",
+            {"inline_keyboard": [[btn("👥 بيانات الطلاب", "a:students"), btn("🏠 الرئيسية", "menu")]]})
+    except Exception as exc:
+        print("[student save error]", exc)
+        _report_save_failure(chat_id, exc)
+
+
 def handle_callback(cq):
     uid = cq["from"]["id"]
     chat_id = cq["message"]["chat"]["id"]
@@ -1101,7 +1659,36 @@ def handle_callback(cq):
 
     try:
         if data == "menu":
-            send(chat_id, *main_menu())
+            send(chat_id, *main_menu(uid))
+        elif data == "me":
+            send(chat_id, *me_screen(uid))
+        elif data == "me:year":
+            send(chat_id, *me_year_screen(uid))
+        elif data.startswith("me:setyear:"):
+            y = int(data.split(":")[2])
+            _save_student_field(chat_id, uid, "year", y)
+        elif data == "me:name":
+            PENDING[uid] = ("stu_name", None)
+            send(chat_id, "✏️ <b>اكتب اسمك الكامل</b> كما في السجل الجامعي:",
+                 {"inline_keyboard": [[btn("❌ إلغاء", "me")]]})
+        elif data == "me:uni":
+            PENDING[uid] = ("stu_uni", None)
+            send(chat_id, "🔢 <b>اكتب رقمك الجامعي</b> (أرقام فقط، من 4 إلى 20 رقمًا):",
+                 {"inline_keyboard": [[btn("❌ إلغاء", "me")]]})
+        elif data.startswith("f:"):
+            _, cid, field = data.split(":", 2)
+            send(chat_id, *course_file_screen(int(cid), field))
+        elif data == "me:reg":
+            start_registration(chat_id, uid, (db.get_student(uid) or {}).get("username", ""))
+        elif data == "skipreg":
+            PENDING.pop(uid, None)
+            _clear_registry(uid)
+            try:
+                db.upsert_student(uid, chat_id)
+            except Exception:
+                pass
+            send(chat_id, "تمام 👌 يمكنك تسجيل بياناتك لاحقًا من:")
+            send(chat_id, *main_menu(uid))
         elif data == "contact":
             send(chat_id, *contact_screen())
         elif data == "channel":
@@ -1133,6 +1720,72 @@ def handle_callback(cq):
         print("[callback error]", exc)
 
 
+def do_export(chat_id, fmt="xlsx"):
+    """يُجهّز ملف الطلاب ويرسله للمشرف بصيغة Excel أو CSV."""
+    students = db.list_students(limit=5000)
+    header = ["#", "الاسم الكامل", "الرقم الجامعي", "السنوة", "اسم المستخدم", "معرّف المحادثة", "تاريخ التسجيل"]
+    rows = []
+    for i, s in enumerate(students, 1):
+        rows.append([
+            i,
+            s.get("full_name") or "",
+            s.get("uni_id") or "",
+            YEAR_TITLES.get(s.get("year"), "") if s.get("year") else "",
+            ("@" + s["username"]) if s.get("username") else "",
+            s.get("chat_id") or "",
+            (s.get("created_at") or "")[:19].replace("T", " "),
+        ])
+    stamp = time.strftime("%Y-%m-%d")
+    if fmt == "csv":
+        blob = "\ufeff" + csv_text(header, rows)
+        send_bytes_file(chat_id, f"students_{stamp}.csv", blob,
+                        "📄 <b>قائمة الطلاب (CSV)</b>\n▫️ العدد: %d" % len(students),
+                        mime="text/csv")
+    else:
+        try:
+            blob = make_xlsx("الطلاب", header, rows)
+        except Exception as exc:
+            print("[xlsx error]", exc)
+            send(chat_id, "⚠️ تعذّر إنشاء ملف Excel، سأرسل لك نسخة CSV بدلًا منه.")
+            blob = "\ufeff" + csv_text(header, rows)
+            send_bytes_file(chat_id, f"students_{stamp}.csv", blob,
+                            "📄 <b>قائمة الطلاب (CSV)</b>\n▫️ العدد: %d" % len(students),
+                            mime="text/csv")
+            return
+        send_bytes_file(chat_id, f"students_{stamp}.xlsx", blob,
+                        "📊 <b>قائمة الطلاب (Excel)</b>\n▫️ العدد: %d" % len(students),
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    send(chat_id, "✅ تم إنشاء الملف وإرساله. تجده في محادثة البوت كمستند يمكنك حفظه أو مشاركته.",
+         {"inline_keyboard": [[btn("📤 تصدير مرة أخرى", "a:export"), btn("🏠 الرئيسية", "menu")]]})
+
+
+def do_broadcast(chat_id, message):
+    """يرسل رسالة لكل الطلاب المسجّلين ويخبر بالنتيجة."""
+    targets = db.all_chat_ids()
+    if not targets:
+        send(chat_id, "⚠️ لا يوجد مستلمون بعد.")
+        return
+    sent = failed = 0
+    for cid in targets:
+        try:
+            res = send(cid, message)
+            if isinstance(res, dict) and res.get("ok") is False:
+                failed += 1
+            else:
+                sent += 1
+        except Exception:
+            failed += 1
+        time.sleep(0.05)  # احترام حدود تلغرام
+    with _DIAG_LOCK:
+        DIAG["broadcast_sent"] = sent
+    send(chat_id,
+         "📣 <b>تم إرسال البث</b>\n" + DIVIDER
+         + "\n✅ وصلت إلى: <b>" + str(sent) + "</b>"
+         + ("\n⚠️ تعذّر الوصول إلى: " + str(failed) if failed else "")
+         + "\n\n<i>ملاحظة: من أوقف البوت (Block) لا تصله الرسائل.</i>",
+         {"inline_keyboard": [[btn("📣 بث جديد", "a:bc"), btn("🏠 الرئيسية", "menu")]]})
+
+
 def admin_callback(chat_id, uid, data):
     parts = data.split(":")
     kind = parts[1]
@@ -1158,6 +1811,31 @@ def admin_callback(chat_id, uid, data):
         send(chat_id, *admin_year_screen(int(parts[2])))
     elif kind == "specs":
         send(chat_id, *admin_year_screen(3))
+    elif kind == "students":
+        send(chat_id, *admin_students_screen())
+    elif kind == "export":
+        fmt = parts[2] if len(parts) > 2 else ""
+        if fmt in ("xlsx", "csv"):
+            send(chat_id, "⏳ جارٍ تجهيز الملف…")
+            do_export(chat_id, fmt)
+        else:
+            send(chat_id, *admin_export_screen())
+    elif kind == "bc":
+        send(chat_id, *admin_broadcast_screen())
+    elif kind == "bcsend":
+        pending = PENDING.get(uid)
+        msg_text = pending[1] if (isinstance(pending, tuple) and pending[0] == "broadcast_confirm") else None
+        PENDING.pop(uid, None)
+        if not msg_text:
+            send(chat_id, "⚠️ انتهت صلاحية الرسالة، أعد كتابتها.")
+            send(chat_id, *admin_broadcast_screen())
+            return
+        send(chat_id, "⏳ جارٍ الإرسال… قد يستغرق قليلًا حسب عدد الطلاب.")
+        do_broadcast(chat_id, msg_text)
+    elif kind == "bcwrite":
+        PENDING[uid] = ("broadcast", None)
+        send(chat_id, "✍️ <b>اكتب الآن نص الرسالة</b> التي تريد بثّها لكل الطلاب:",
+             {"inline_keyboard": [[btn("❌ إلغاء", "a:bc")]]})
     elif kind == "asp":
         send(chat_id, *admin_spec_screen(int(parts[2])))
     elif kind == "ac":
@@ -1180,6 +1858,14 @@ def admin_callback(chat_id, uid, data):
     elif kind == "addsp":
         PENDING[uid] = ("new_spec", None)
         send(chat_id, "➕ أرسل اسم التخصص الجديد:")
+    elif kind == "mvc":
+        send(chat_id, *admin_move_course_screen(int(parts[2])))
+    elif kind == "setc":
+        cid, sid = int(parts[2]), int(parts[3])
+        db.update_course(cid, spec_id=sid)
+        spec = db.get_spec(sid)
+        send(chat_id, "✅ تم نقل المقرر إلى تخصص «" + esc(spec["name"] if spec else "-") + "».")
+        send(chat_id, *admin_spec_screen(sid))
     elif kind == "addc":
         year = int(parts[2])
         spec_id = int(parts[3]) if len(parts) > 3 else None
@@ -1294,6 +1980,62 @@ def handle_text(msg):
         send(chat_id, "استخدم القائمة 👇", {"inline_keyboard": [[btn("🏠 القائمة الرئيسية", "menu")]]})
         return
 
+    # ---------- تسجيل الطالب وتعديل بياناته (لا يحتاج صلاحية مشرف) ----------
+    if isinstance(pending, tuple) and pending[0] in ("reg_name", "reg_uni", "stu_name", "stu_uni"):
+        kind = pending[0]
+        if text == "-":
+            send(chat_id, "⚠️ لا يمكن ترك هذا الحقل فارغًا.",
+                 {"inline_keyboard": [[btn("🏠 القائمة الرئيسية", "menu")]]})
+            return
+        if kind in ("reg_name", "stu_name"):
+            ok, res = valid_name(text)
+            if not ok:
+                PENDING[uid] = pending
+                send(chat_id, "❌ " + res + "\n\n<i>أعد كتابة الاسم:</i>")
+                return
+            if kind == "reg_name":
+                _set_registry(uid, "full_name", res)
+                PENDING[uid] = ("reg_uni", None)
+                send(chat_id, "✅ تم حفظ الاسم.\n\n🔢 <b>الآن اكتب رقمك الجامعي</b> "
+                              "(أرقام فقط، من 4 إلى 20 رقمًا):")
+            else:
+                _save_student_field(chat_id, uid, "full_name", res)
+            return
+        if kind in ("reg_uni", "stu_uni"):
+            ok, res = valid_uni_id(text)
+            if not ok:
+                PENDING[uid] = pending
+                send(chat_id, "❌ " + res + "\n\n<i>أعد كتابة الرقم الجامعي:</i>")
+                return
+            if kind == "reg_uni":
+                _set_registry(uid, "uni_id", res)
+                data_reg = _get_registry(uid)
+                existing = db.get_student(uid) or {}
+                try:
+                    db.upsert_student(uid, chat_id, full_name=data_reg.get("full_name", ""),
+                                      uni_id=res,
+                                      username=(data_reg.get("username") or existing.get("username") or ""),
+                                      year=(existing.get("year") or None))
+                except Exception:
+                    pass
+                _clear_registry(uid)
+                with _DIAG_LOCK:
+                    DIAG["students"] = db.count_students()
+                send(chat_id, "🎉 <b>تم تسجيلك بنجاح!</b>\n" + DIVIDER
+                     + "\n👤 " + esc(data_reg.get("full_name", ""))
+                     + "\n🔢 " + esc(res)
+                     + "\n\nاستخدم القائمة للتنقّل 👇")
+                send(chat_id, *main_menu(uid))
+                notify_admins(
+                    "🆕 <b>طالب جديد سجّل بياناته</b>\n" + DIVIDER + "\n"
+                    + "👤 " + esc(data_reg.get("full_name", "")) + "\n"
+                    + "🔢 " + esc(res) + "\n"
+                    + "🆔 <code>" + str(uid) + "</code>",
+                    {"inline_keyboard": [[btn("👥 بيانات الطلاب", "a:students")]]})
+            else:
+                _save_student_field(chat_id, uid, "uni_id", res)
+            return
+
     if pending == "__search__":
         results = search_courses(text)
         if not results:
@@ -1315,6 +2057,22 @@ def handle_text(msg):
         value = "" if text == "-" else text
         kind, meta = (pending if isinstance(pending, tuple) else (pending, None))
 
+        if kind == "broadcast":
+            if not text.strip():
+                send(chat_id, "⚠️ الرسالة فارغة، أعد المحاولة.")
+                return
+            PENDING[uid] = ("broadcast_confirm", text)
+            preview = text[:300] + ("…" if len(text) > 300 else "")
+            send(chat_id,
+                 "📣 <b>معاينة رسالة البث</b>\n" + DIVIDER + "\n" + preview
+                 + "\n" + DIVIDER + "\n👥 سيصل إلى: <b>" + str(len(db.all_chat_ids())) + "</b> مستلم\n\nهل تريد الإرسال؟",
+                 {"inline_keyboard": [
+                     [btn("✅ إرسال الآن", "a:bcsend"), btn("❌ إلغاء", "a:bc")],
+                 ]})
+            return
+        if kind == "broadcast_confirm":
+            # وصل نص قديم بعد الإرسال، نتجاهله بهدوء
+            return
         if kind == "setting":
             db.set_setting(meta, value)
             send(chat_id, f"✅ تم الحفظ: {esc(value) or '—'}")
@@ -1484,6 +2242,7 @@ def help_text():
         "📘📗📙📕 <b>السنوات الأربع</b> — مقررات كل سنة وروابط مجموعاتها.\n"
         "🎯 <b>التخصصات</b> — تخصصات السنة الثالثة وتفاصيلها.\n"
         "🔎 <b>بحث عن مقرر</b> — اكتب أي جزء من اسم المقرر وسيظهر لك.\n"
+        "⚙️ <b>إعداداتي</b> — عدّل اسمك ورقمك الجامعي وسنتك في أي وقت.\n"
         "📞 <b>تواصل معنا</b> — للاستفسارات والدعم.\n\n"
         + DIVIDER + "\n"
         "⌨️ <b>الأوامر</b>\n"
@@ -1491,7 +2250,12 @@ def help_text():
         "/help — هذه المساعدة\n"
         "/id — عرض معرّف حسابك\n"
         "/cancel — إلغاء أي إدخال\n\n"
-        "🛠 <i>للمشرف:</i> /admin ثم كلمة المرور — يمكنك تعديل كل شيء من داخل تلغرام بلا لمس الكود."
+        "🛠 <i>للمشرف فقط:</i>\n"
+        "/admin — لوحة التحكم (تعديل كل شيء من داخل تلغرام)\n"
+        "/broadcast — إرسال تعميم لكل الطلاب\n"
+        "/export — تنزيل بيانات الطلاب (Excel أو CSV)\n"
+        "/status — حالة البوت\n"
+        "/testdb — فحص التخزين"
     )
 
 
@@ -1513,7 +2277,20 @@ def handle_update(update):
             text = (msg.get("text") or "").strip()
 
             if text.startswith("/start"):
-                send(chat_id, *main_menu())
+                username = (msg.get("from", {}) or {}).get("username", "")
+                known = None
+                try:
+                    known = db.get_student(uid)
+                except Exception:
+                    known = None
+                if ASK_STUDENT_DATA and known is None:
+                    start_registration(chat_id, uid, username)
+                else:
+                    try:
+                        db.upsert_student(uid, chat_id, username=username)
+                    except Exception as exc:
+                        print("[student touch warning]", exc)
+                    send(chat_id, *main_menu(uid))
             elif text.startswith("/help"):
                 send(chat_id, help_text())
             elif text.startswith("/id"):
@@ -1526,6 +2303,18 @@ def handle_update(update):
             elif text.startswith("/testdb"):
                 if is_admin(uid):
                     send(chat_id, *test_db_text())
+                else:
+                    send(chat_id, "🔐 هذا الأمر للمشرفين فقط.")
+            elif text.startswith("/broadcast"):
+                if is_admin(uid):
+                    send(chat_id, *admin_broadcast_screen())
+                else:
+                    send(chat_id, "🔐 هذا الأمر للمشرفين فقط.")
+            elif text.startswith("/export"):
+                if is_admin(uid):
+                    fmt = "csv" if "csv" in text.lower() else "xlsx"
+                    send(chat_id, "⏳ جارٍ تجهيز الملف…")
+                    do_export(chat_id, fmt)
                 else:
                     send(chat_id, "🔐 هذا الأمر للمشرفين فقط.")
             elif text.startswith("/admin"):
@@ -1812,6 +2601,8 @@ def set_my_commands():
         {"command": "id", "description": "🆔 عرض معرّف حسابك"},
         {"command": "cancel", "description": "❌ إلغاء أي إدخال حالي"},
         {"command": "admin", "description": "🛠 لوحة تحكم المشرف"},
+        {"command": "broadcast", "description": "📣 بث عام لكل الطلاب"},
+        {"command": "export", "description": "📤 تصدير بيانات الطلاب"},
     ]
     result = api("setMyCommands", commands=commands,
                  scope={"type": "default"},
