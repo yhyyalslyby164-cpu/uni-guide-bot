@@ -547,7 +547,7 @@ if db is None:  # حالة تحميل غير اعتيادي: ننشئ مساحة
 
 
 # --------------------------------------------------------------------- config
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+BOT_TOKEN = (os.getenv("BOT_TOKEN", "") or "").strip().strip('"').strip("'").strip()
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()
 
 # كشف عنوان الاستضافة تلقائيًا (Render / Railway / Koyeb) ليعمل الويب هوك بلا إعداد يدوي
@@ -557,7 +557,11 @@ if not WEBHOOK_URL:
         if _val:
             WEBHOOK_URL = _val if _val.startswith("http") else "https://" + _val
             break
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "uniguide-secret")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "uniguide-secret") or "uniguide-secret"
+# تلغرام يسمح فقط بحروف/أرقام و _ و - في التوقيع؛ نُنظّفه حتى لا يفشل التسجيل
+import re as _re
+WEBHOOK_SECRET = _re.sub(r"[^A-Za-z0-9_-]", "-", WEBHOOK_SECRET).strip("-") or "uniguide-secret"
+WEBHOOK_SECRET = WEBHOOK_SECRET[:256]
 WEBHOOK_PATH = (os.getenv("WEBHOOK_PATH", "/telegram") or "/telegram").strip()
 if WEBHOOK_PATH and not WEBHOOK_PATH.startswith("/"):
     WEBHOOK_PATH = "/" + WEBHOOK_PATH
@@ -596,21 +600,60 @@ COURSE_FIELDS = [
 PENDING = {}
 ADMIN_STATE = set()
 
+# ------------------------------------------------------------------ تشخيص
+DIAG = {
+    "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    "mode": "غير محدّد",
+    "received_updates": 0,
+    "last_update_id": None,
+    "last_received_at": None,
+    "last_reply_ok": None,
+    "last_reply_error": None,
+    "token_ok": None,
+    "bot_username": None,
+    "token_message": None,
+    "webhook_url": None,
+    "pending_count": None,
+    "last_webhook_error": None,
+}
+_DIAG_LOCK = threading.Lock()
+
 
 # ---------------------------------------------------------------- telegram API
 def api(method, **params):
     url = API.format(token=BOT_TOKEN, method=method)
     data = json.dumps(params, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    last = None
     for attempt in range(3):
         try:
             with urllib.request.urlopen(req, timeout=70) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+                result = json.loads(resp.read().decode("utf-8"))
+            if method in ("sendMessage", "editMessageText"):
+                with _DIAG_LOCK:
+                    DIAG["last_reply_ok"] = bool(result.get("ok"))
+                    DIAG["last_reply_error"] = None if result.get("ok") else str(
+                        result.get("description", "غير معروف"))
+                    if not result.get("ok"):
+                        print("⚠️ فشل إرسال الرد:", result.get("description"))
+            return result
+        except urllib.error.HTTPError as exc:
+            last = f"HTTP {exc.code}"
+            try:
+                body = json.loads(exc.read().decode("utf-8"))
+                last = str(body.get("description", last))
+            except Exception:
+                pass
         except Exception as exc:  # pragma: no cover
-            if attempt == 2:
-                print("[api error]", method, exc)
-                return {"ok": False}
+            last = f"{type(exc).__name__}: {exc}"
+        if attempt < 2:
             time.sleep(2)
+    print("[api error]", method, last)
+    if method in ("sendMessage", "editMessageText"):
+        with _DIAG_LOCK:
+            DIAG["last_reply_ok"] = False
+            DIAG["last_reply_error"] = str(last)
+    return {"ok": False, "description": last}
 
 
 def send(chat_id, text, keyboard=None, preview=False):
@@ -1173,6 +1216,10 @@ def help_text():
 
 def handle_update(update):
     try:
+        with _DIAG_LOCK:
+            DIAG["received_updates"] = DIAG.get("received_updates", 0) + 1
+            DIAG["last_update_id"] = update.get("update_id")
+            DIAG["last_received_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
         if "message" in update:
             msg = update["message"]
             uid = msg["from"]["id"]
@@ -1213,8 +1260,117 @@ def handle_update(update):
 
 
 # ------------------------------------------------------------------- webhook mode
+def check_token():
+    """يتأكد من صحة التوكن ويعرض حالة واضحة بالعربية."""
+    if not BOT_TOKEN:
+        with _DIAG_LOCK:
+            DIAG["token_ok"] = False
+            DIAG["token_message"] = "لم يُضبط BOT_TOKEN في متغيرات البيئة"
+        print("❌ لم يُضبط BOT_TOKEN. أضِفه في Environment على Render.")
+        return False
+    info = api("getMe")
+    ok = bool(info.get("ok"))
+    msg = "التوكن صالح ✅" if ok else ("التوكن غير صالح ❌ (" + str(info.get("description", "سبب غير معروف")) + ")")
+    user = (info.get("result") or {}).get("username")
+    with _DIAG_LOCK:
+        DIAG["token_ok"] = ok
+        DIAG["token_message"] = msg
+        DIAG["bot_username"] = user
+    print(("✅" if ok else "❌"), msg, ("| البوت: @" + user) if user else "")
+    if not ok:
+        print("   ➜ الحل: @BotFather ← /revoke ← انسخ التوكن الجديد")
+        print("            ثم Render ← Environment ← BOT_TOKEN ← الصق ← Save")
+    return ok
+
+
+def refresh_webhook_info():
+    try:
+        info = api('getWebhookInfo').get('result', {}) or {}
+        with _DIAG_LOCK:
+            DIAG['webhook_url'] = (info.get('url') or '(لا يوجد)')
+            DIAG['pending_count'] = info.get('pending_update_count', 0)
+            DIAG['last_webhook_error'] = info.get('last_error_message') or None
+    except Exception as exc:
+        print('[webhook info warning]', exc)
+
+
+def status_page():
+    refresh_webhook_info()
+    with _DIAG_LOCK:
+        d = dict(DIAG)
+
+    def row(label, value, good=None):
+        color = '#1a7f37' if good is True else ('#b42318' if good is False else '#333')
+        return ("<tr><td class='k'>" + str(label) + "</td><td class='v' style='color:"
+                + color + "'>" + str(value) + "</td></tr>")
+
+    rows = [
+        row('وقت التشغيل', d.get('started_at') or '-'),
+        row('وضع العمل', d.get('mode') or '-'),
+        row('حالة التوكن', d.get('token_message') or 'قيد الفحص', d.get('token_ok')),
+        row('اسم البوت', ('@' + d['bot_username']) if d.get('bot_username') else '-', d.get('token_ok')),
+        row('الرابط المسجَّل عند تلغرام', d.get('webhook_url') or '-'),
+        row('تحديثات معلّقة', d.get('pending_count') if d.get('pending_count') is not None else '-'),
+        row('آخر خطأ من تلغرام', d.get('last_webhook_error') or 'لا يوجد'),
+        row('عدد الرسائل الواصلة', d.get('received_updates', 0)),
+        row('آخر رسالة وصلت', d.get('last_received_at') or 'لم تصل أي رسالة بعد'),
+        row('حالة آخر رد',
+            ('نجح ✅' if d.get('last_reply_ok') is True else
+             (('فشل ❌ — ' + str(d.get('last_reply_error'))) if d.get('last_reply_ok') is False else 'لم يُرسل بعد')),
+            d.get('last_reply_ok')),
+    ]
+
+    if d.get('token_ok') is False:
+        cls = 'bad'
+        tip = ('السبب الأرجح لتوقف الرد: التوكن غير صالح. افتح @BotFather ← /revoke'
+               ' ← اختر بوتك ← انسخ التوكن الجديد ← Render ← Environment'
+               ' ← عدّل BOT_TOKEN ← Save.')
+    elif d.get('received_updates', 0) == 0:
+        cls = 'warn'
+        tip = ('لم تصل أي رسالة بعد. أرسل /start في تلغرام (مرتين إن كانت'
+               ' الخدمة نائمة) ثم حدّث هذه الصفحة.')
+    else:
+        cls = 'good'
+        tip = 'البوت يستقبل الرسائل ويردّ. كل شيء يعمل.'
+
+    css = ("body{font-family:-apple-system,Segoe UI,Tahoma,sans-serif;background:#f6f7f9;margin:0;padding:16px}"
+           ".card{max-width:640px;margin:0 auto;background:#fff;border-radius:14px;padding:18px;box-shadow:0 2px 10px rgba(0,0,0,.06)}"
+           "h2{margin:0 0 4px}.sub{color:#777;margin:0 0 14px;font-size:14px}"
+           "table{width:100%;border-collapse:collapse;font-size:15px}"
+           "td{padding:8px;border-bottom:1px solid #eee}.k{color:#555}.v{font-weight:600}"
+           ".tip{padding:12px;border-radius:8px;margin:14px 0;line-height:1.7}"
+           ".good{background:#f0fff4;border:1px solid #b7ebc6;color:#1a7f37}"
+           ".warn{background:#fffbe6;border:1px solid #ffe58f;color:#874d00}"
+           ".bad{background:#fff4f4;border:1px solid #ffc9c9;color:#b42318}")
+
+    html = ("<!DOCTYPE html><html lang='ar' dir='rtl'><head><meta charset='utf-8'>"
+            "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            "<title>حالة البوت</title><style>" + css + "</style></head><body>"
+            "<div class='card'><h2>حالة بوت المرشد الجامعي</h2>"
+            "<p class='sub'>صفحة تشخيص مباشرة — حدّثها بعد إرسال /start</p>"
+            "<div class='tip " + cls + "'>" + tip + "</div>"
+            "<table>" + ''.join(rows) + "</table>"
+            "<p style='color:#999;font-size:12px;margin-top:14px'>"
+            "لا تُعرض هنا أي أسرار أو مفاتيح.</p></div></body></html>")
+    return html.encode('utf-8')
+
+
 def set_webhook():
+    """يسجّل الويب هوك، ويضمن دائماً تطابق الرابط والتوقيع السري مع تلغرام."""
     url = WEBHOOK_URL.rstrip("/") + WEBHOOK_PATH
+    # (1) نتحقق أولاً من الحالة المسجَّلة عند تلغرام
+    try:
+        info = api("getWebhookInfo").get("result", {}) or {}
+        current = (info.get("url") or "").strip()
+        print("🔎 الويب هوك المسجَّل عند تلغرام:", current or "(لا يوجد)")
+    except Exception as exc:
+        print("[webhook check warning]", exc)
+
+    # (2) نعيد التسجيل دائماً: يضمن تطابق الرابط + التوقيع السري بعد أي إعادة نشر
+    try:
+        api("deleteWebhook", drop_pending_updates=False)
+    except Exception:
+        pass
     result = api(
         "setWebhook",
         url=url,
@@ -1223,24 +1379,13 @@ def set_webhook():
         allowed_updates=["message", "callback_query"],
     )
     print(f"🔗 تم ربط الويب هوك: {url} -> {result.get('description', result)}")
-    # نتحقق فعليًا من الرابط المسجَّل عند تلغرام، وإن كان مختلفًا نعيد التسجيل
     try:
         info = api("getWebhookInfo").get("result", {}) or {}
-        current = (info.get("url") or "").strip()
-        print("🔎 الويب هوك المسجَّل عند تلغرام:", current or "(لا يوجد)")
-        if current != url:
-            print("♻️ الرابط المسجَّل مختلف — إعادة التسجيل على الرابط الصحيح...")
-            api("deleteWebhook", drop_pending_updates=False)
-            result2 = api(
-                "setWebhook",
-                url=url,
-                secret_token=WEBHOOK_SECRET,
-                drop_pending_updates=False,
-                allowed_updates=["message", "callback_query"],
-            )
-            print("🔗 إعادة التسجيل:", result2.get("description", result2))
-    except Exception as exc:  # لا نعطّل التشغيل بسبب التحقق
-        print("[webhook check warning]", exc)
+        print("🔎 بعد التسجيل:", (info.get("url") or "(لا يوجد)"),
+              "| تحديثات معلّقة:", info.get("pending_update_count", "?"),
+              "| آخر خطأ:", info.get("last_error_message", "لا يوجد"))
+    except Exception:
+        pass
 
 
 def delete_webhook():
@@ -1256,7 +1401,16 @@ class WebhookHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        # أي طلب فحص يعيد ok (يساعد على إبقاء الخدمة مستيقظة وعلى الفحص الصحي)
+        # صفحة الحالة (تشخيص) + أي طلب فحص آخر يعيد ok
+        path = self.path.split("?", 1)[0].rstrip("/") or "/"
+        if path in ("/status", "/diag", "/check"):
+            page = status_page()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(page)))
+            self.end_headers()
+            self.wfile.write(page)
+            return
         self._reply(200, "ok".encode())
 
     def do_POST(self):
@@ -1264,7 +1418,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
         # المسار المحلي، وكان ذلك يرد "404" فتصل رسائل الناس ولا يردّ البوت.
         path = self.path.split("?", 1)[0]
         secret = self.headers.get("X-Telegram-Bot-Api-Secret-Token")
-        if secret and secret != WEBHOOK_SECRET:
+        if secret != WEBHOOK_SECRET:
             print(f"[webhook] رُفض طلب على المسار {path}: التوقيع السري غير مطابق")
             self._reply(403, "forbidden".encode())
             return
@@ -1288,8 +1442,10 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
 
 def run_webhook():
+    DIAG["mode"] = "وضع الويب هوك (Webhook)"
     db.init_db()
     restore_from_env()
+    check_token()
     set_webhook()
     server = ThreadingHTTPServer((HOST, PORT), WebhookHandler)
     print(f"🌐 البوت يعمل بوضع الويب هوك على {HOST}:{PORT}{WEBHOOK_PATH}")
@@ -1300,8 +1456,10 @@ def run_webhook():
 
 
 def run_polling():
+    DIAG["mode"] = "الاستقبال المباشر (Polling)"
     db.init_db()
     restore_from_env()
+    check_token()
     # إن كان هناك ويب هوك مسجَّل مسبقيًا فهو يمنع الاستقبال المباشر، لذا نزيله
     delete_webhook()
     print("🤖 البوت يعمل الآن بوضع الاستقبال المباشر... (Ctrl+C للإيقاف)")
