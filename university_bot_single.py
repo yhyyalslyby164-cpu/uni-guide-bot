@@ -627,6 +627,7 @@ DIAG = {
     "last_webhook_error": None,
     "storage_ok": None,
     "storage_note": None,
+    "last_db_error": None,
 }
 _DIAG_LOCK = threading.Lock()
 
@@ -918,6 +919,7 @@ def admin_menu():
             [btn("📙 الثالثة", "a:y:3"), btn("📕 الرابعة", "a:y:4")],
             [btn("🎯 إدارة التخصصات", "a:specs")],
             [btn("💾 نسخة احتياطية", "a:backup"), btn("📥 استعادة نسخة", "a:restore")],
+            [btn("🔍 فحص التخزين", "a:testdb"), btn("🩺 حالة البوت", "a:status")],
             [btn("👁 معاينة البوت", "menu")],
         ]
     }
@@ -1049,6 +1051,10 @@ def admin_callback(chat_id, uid, data):
 
     if kind == "menu":
         send(chat_id, *admin_menu())
+    elif kind == "status":
+        send(chat_id, *status_text())
+    elif kind == "testdb":
+        send(chat_id, *test_db_text())
     elif kind == "gen":
         send(chat_id, *admin_gen_screen())
     elif kind == "sched":
@@ -1208,47 +1214,166 @@ def handle_text(msg):
         send(chat_id, "🔐 غير مسموح.")
         return
 
-    value = "" if text == "-" else text
-    kind, meta = (pending if isinstance(pending, tuple) else (pending, None))
+    # كل عمليات الحفظ محميّة: أي فشل في التخزين يُبلَّغ عنه صراحة
+    # بدل أن يصمت البوت بلا رد (وهذا كان سبب اختفاء رسالة «تم الحفظ»).
+    try:
+        value = "" if text == "-" else text
+        kind, meta = (pending if isinstance(pending, tuple) else (pending, None))
 
-    if kind == "setting":
-        db.set_setting(meta, value)
-        send(chat_id, f"✅ تم الحفظ: {esc(value) or '—'}")
-        if meta in dict(GENERAL_FIELDS):
-            send(chat_id, *admin_gen_screen())
+        if kind == "setting":
+            db.set_setting(meta, value)
+            send(chat_id, f"✅ تم الحفظ: {esc(value) or '—'}")
+            if meta in dict(GENERAL_FIELDS):
+                send(chat_id, *admin_gen_screen())
+            else:
+                send(chat_id, *admin_sched_screen())
+        elif kind == "year_group":
+            db.set_year_group(meta, value)
+            send(chat_id, "✅ تم حفظ رابط المجموعة.")
+            send(chat_id, *admin_year_screen(meta))
+        elif kind == "spec_name":
+            db.update_spec(meta, name=value or "تخصص")
+            send(chat_id, "✅ تم تعديل الاسم.")
+            send(chat_id, *admin_spec_screen(meta))
+        elif kind == "spec_link":
+            db.update_spec(meta, group_link=value)
+            send(chat_id, "✅ تم حفظ الرابط.")
+            send(chat_id, *admin_spec_screen(meta))
+        elif kind == "new_spec":
+            sid = db.add_spec(value or "تخصص جديد")
+            send(chat_id, "✅ تمت إضافة التخصص.")
+            send(chat_id, *admin_spec_screen(sid))
+        elif kind == "new_course_name":
+            year, spec_id = meta
+            cid = db.add_course(year, spec_id, value or "مقرر جديد")
+            send(chat_id, "✅ تمت إضافة المقرر.")
+            send(chat_id, *admin_course_screen(cid))
+        elif kind == "course_name":
+            db.update_course(meta, name=value or "مقرر")
+            send(chat_id, "✅ تم تعديل الاسم.")
+            send(chat_id, *admin_course_screen(meta))
+        elif kind == "course_link":
+            cid, field = meta
+            db.update_course(cid, **{field: value})
+            send(chat_id, "✅ تم حفظ الرابط.")
+            send(chat_id, *admin_course_screen(cid))
+    except Exception as exc:
+        with _DIAG_LOCK:
+            DIAG["last_db_error"] = "%s: %s" % (type(exc).__name__, exc)
+        print("[save error]", type(exc).__name__, exc)
+        _report_save_failure(chat_id, exc)
+
+
+
+def _db_hint(exc):
+    """يحوّل خطأ التخزين إلى تلميح عملي بالعربية."""
+    msg = str(exc)
+    if "does not exist" in msg or "404" in msg or "PGRST" in msg or "relation" in msg:
+        return ("الجداول غير موجودة في قاعدة البيانات السحابية. "
+                "افتح Supabase ← SQL Editor والصق كود إنشاء الجداول مرة واحدة ثم Run.")
+    if "401" in msg or "403" in msg or "Invalid API key" in msg or "JWT" in msg:
+        return ("مفتاح Supabase غير صحيح. تأكد أنك نسخت مفتاح service_role "
+                "(وليس anon public) ووضعته في Render → Environment باسم SUPABASE_KEY.")
+    if "paused" in msg.lower() or "is not active" in msg.lower() or "project" in msg.lower() and "not found" in msg.lower():
+        return ("يبدو أن مشروع Supabase مُوقوف مؤقتًا (الخطة المجانية توقف "
+                "المشاريع الخاملة). افتح supabase.com ← مشروعك ← اضغط Restore "
+                "أو Resume، ثم أعد المحاولة.")
+    if "getaddrinfo" in msg or "Name or service not known" in msg or "timed out" in msg or "Temporary failure" in msg:
+        return ("تعذّر الاتصال بالإنترنت من الخدمة. تحقّق من SUPABASE_URL في Render.")
+    if "readonly" in msg.lower() or "unable to open" in msg.lower() or "disk" in msg.lower():
+        return ("مساحة التخزين المؤقتة ممتلئة. اربط Supabase لتصبح البيانات دائمة.")
+    return "تحقّق من متغيّرات SUPABASE_URL و SUPABASE_KEY في Render ← Environment."
+
+
+def _report_save_failure(chat_id, exc):
+    """يخبر المشرف أن الحفظ لم ينجح — مع السبب الأرجح وكيفية إصلاحه."""
+    send(
+        chat_id,
+        "⚠️ <b>لم يتم الحفظ</b>\n\n"
+        "💡 " + esc(_db_hint(exc)) + "\n\n"
+        "<i>تفاصيل تقنية (للتشخيص):</i>\n"
+        "<code>" + esc(str(exc)[:160]) + "</code>",
+        {"inline_keyboard": [
+            [btn("🔁 حاول مرة أخرى", "a:menu")],
+            [btn("🏠 القائمة الرئيسية", "menu")],
+        ]},
+    )
+
+
+# ------------------------------------------- تشخيص من داخل تلغرام نفسه
+def status_text():
+    """ملخّص الحالة يُرسل كرسالة في تلغرام — للمشرف فقط."""
+    with _DIAG_LOCK:
+        d = dict(DIAG)
+    ok = d.get("token_ok")
+    st = d.get("storage_ok")
+    lines = [
+        "🩺 <b>حالة البوت</b>", "",
+        "• التوكن: " + ("سليم ✅" if ok else ("غير صالح ❌" if ok is False else "قيد الفحص")),
+        "• التخزين: <b>" + storage_label() + "</b>",
+        "• فحص قاعدة البيانات: " + (
+            "سليم ✅" if st is True else ("ناقص ❌" if st is False else "محلي مؤقت ⚠️")),
+        "• الرسائل الواصلة: " + str(d.get("received_updates", 0)),
+        "• آخر رسالة: " + str(d.get("last_received_at") or "—"),
+        "• آخر رد: " + (
+            "نجح ✅" if d.get("last_reply_ok") is True else
+            ("فشل ❌" if d.get("last_reply_ok") is False else "—")),
+    ]
+    if d.get("storage_note"):
+        lines.append("• ملاحظة: " + esc(str(d["storage_note"])))
+    if d.get("last_db_error"):
+        lines.append("• آخر خطأ تخزين: <code>" + esc(str(d["last_db_error"])[:120]) + "</code>")
+    if ok is False or st is False:
+        lines.append("")
+        lines.append("💡 " + esc(_db_hint(RuntimeError(str(d.get("last_db_error") or d.get("storage_note") or "")))))
+    text = "\n".join(lines)
+    kb = {"inline_keyboard": [
+        [btn("🔍 فحص التخزين الآن", "a:testdb")],
+        [btn("💾 نسخة احتياطية", "a:backup"), btn("🏠 القائمة", "menu")],
+    ]}
+    return text, kb
+
+
+def test_db_text():
+    """يجري اختبارًا حقيقيًا على التخزين ويشرح النتيجة بالعربية."""
+    lines = ["🔍 <b>اختبار التخزين</b>", "", "• الوضع: <b>" + storage_label() + "</b>", ""]
+    problems = []
+    for table in TABLES:
+        try:
+            _select(table, limit=1)
+            lines.append("  ✅ قراءة " + table)
+        except Exception as exc:
+            problems.append((table, "قراءة", exc))
+            lines.append("  ❌ " + table + " — غير متاح")
+    # اختبار الكتابة (إضافة صف تجريبي ثم حذفه)
+    try:
+        _upsert("settings", {"key": "__test__", "value": "1"}, ["key"])
+        try:
+            _delete("settings", {"key": "__test__"})
+        except Exception:
+            pass
+        lines.append("")
+        lines.append("  ✅ الكتابة والقراءة تعمل — الحفظ سليم <b>100%</b>")
+        lines.append("")
+        lines.append("🎉 جرّب الآن تعديل أي قيمة وستظهر «تم الحفظ».")
+    except Exception as exc:
+        problems.append(("settings", "كتابة", exc))
+        lines.append("")
+        lines.append("  ❌ الكتابة فشلت (الحفظ لا يعمل).")
+        lines.append("")
+        lines.append("💡 " + esc(_db_hint(exc)))
+        lines.append("")
+        lines.append("<i>تفاصيل تقنية:</i>\n<code>" + esc(str(exc)[:160]) + "</code>")
+    with _DIAG_LOCK:
+        if problems:
+            DIAG["last_db_error"] = "%s: %s" % (type(problems[0][2]).__name__, problems[0][2])
         else:
-            send(chat_id, *admin_sched_screen())
-    elif kind == "year_group":
-        db.set_year_group(meta, value)
-        send(chat_id, "✅ تم حفظ رابط المجموعة.")
-        send(chat_id, *admin_year_screen(meta))
-    elif kind == "spec_name":
-        db.update_spec(meta, name=value or "تخصص")
-        send(chat_id, "✅ تم تعديل الاسم.")
-        send(chat_id, *admin_spec_screen(meta))
-    elif kind == "spec_link":
-        db.update_spec(meta, group_link=value)
-        send(chat_id, "✅ تم حفظ الرابط.")
-        send(chat_id, *admin_spec_screen(meta))
-    elif kind == "new_spec":
-        sid = db.add_spec(value or "تخصص جديد")
-        send(chat_id, "✅ تمت إضافة التخصص.")
-        send(chat_id, *admin_spec_screen(sid))
-    elif kind == "new_course_name":
-        year, spec_id = meta
-        cid = db.add_course(year, spec_id, value or "مقرر جديد")
-        send(chat_id, "✅ تمت إضافة المقرر.")
-        send(chat_id, *admin_course_screen(cid))
-    elif kind == "course_name":
-        db.update_course(meta, name=value or "مقرر")
-        send(chat_id, "✅ تم تعديل الاسم.")
-        send(chat_id, *admin_course_screen(meta))
-    elif kind == "course_link":
-        cid, field = meta
-        db.update_course(cid, **{field: value})
-        send(chat_id, "✅ تم حفظ الرابط.")
-        send(chat_id, *admin_course_screen(cid))
-
+            DIAG["last_db_error"] = None
+            DIAG["storage_ok"] = True if USE_SUPABASE else None
+    kb = {"inline_keyboard": [
+        [btn("🔁 أعد الفحص", "a:testdb"), btn("🛠 لوحة التحكم", "a:menu")],
+    ]}
+    return "\n".join(lines), kb
 
 # --------------------------------------------------------------------- update
 def help_text():
@@ -1257,7 +1382,9 @@ def help_text():
         "/start — القائمة الرئيسية\n"
         "/admin — لوحة المشرف\n"
         "/id — عرض معرّفك\n"
-        "/cancel — إلغاء أي إدخال\n\n"
+        "/cancel — إلغاء أي إدخال\n"
+        "/status — حالة البوت\n"
+        "/testdb — فحص التخزين\n\n"
         "تصفّح الأقسام من الأزرار: المعلومات العامة، الجداول، السنوات الأربع، والبحث.\n"
         "المشرف يمكنه إضافة الروابط وتعديلها وحذفها من لوحة التحكم دون لمس الكود."
     )
@@ -1286,6 +1413,16 @@ def handle_update(update):
                 send(chat_id, help_text())
             elif text.startswith("/id"):
                 send(chat_id, f"🆔 معرّفك: <code>{uid}</code>")
+            elif text.startswith("/status"):
+                if is_admin(uid):
+                    send(chat_id, *status_text())
+                else:
+                    send(chat_id, "🔐 هذا الأمر للمشرفين فقط.")
+            elif text.startswith("/testdb"):
+                if is_admin(uid):
+                    send(chat_id, *test_db_text())
+                else:
+                    send(chat_id, "🔐 هذا الأمر للمشرفين فقط.")
             elif text.startswith("/admin"):
                 if is_admin(uid):
                     send(chat_id, *admin_menu())
@@ -1356,6 +1493,7 @@ def status_page():
     rows = [
         row('نوع التخزين', storage_label(), USE_SUPABASE),
         row('فحص قاعدة البيانات', d.get('storage_note') or 'قيد الفحص', d.get('storage_ok')),
+        row('آخر خطأ في التخزين', d.get('last_db_error') or 'لا يوجد'),
         row('وقت التشغيل', d.get('started_at') or '-'),
         row('وضع العمل', d.get('mode') or '-'),
         row('حالة التوكن', d.get('token_message') or 'قيد الفحص', d.get('token_ok')),
