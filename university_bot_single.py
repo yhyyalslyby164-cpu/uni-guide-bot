@@ -20,6 +20,7 @@
 import html
 import json
 import os
+import re
 import sqlite3
 import urllib.error
 import urllib.parse
@@ -622,10 +623,13 @@ _DIAG_LOCK = threading.Lock()
 # ---------------------------------------------------------------- telegram API
 def api(method, **params):
     url = API.format(token=BOT_TOKEN, method=method)
+    tries = int(params.pop("_tries", 3))
+    # نتجاهل أي قيمة فارغة (None) حتى لا يرفضها تلغرام
+    params = {k: v for k, v in params.items() if v is not None}
     data = json.dumps(params, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
     last = None
-    for attempt in range(3):
+    for attempt in range(max(1, tries)):
         try:
             with urllib.request.urlopen(req, timeout=70) as resp:
                 result = json.loads(resp.read().decode("utf-8"))
@@ -646,7 +650,7 @@ def api(method, **params):
                 pass
         except Exception as exc:  # pragma: no cover
             last = f"{type(exc).__name__}: {exc}"
-        if attempt < 2:
+        if attempt < max(1, tries) - 1:
             time.sleep(2)
     print("[api error]", method, last)
     if method in ("sendMessage", "editMessageText"):
@@ -656,15 +660,49 @@ def api(method, **params):
     return {"ok": False, "description": last}
 
 
+def _plain(text):
+    """يزيل وسوم HTML للاستخدام في المحاولة الاحتياطية."""
+    return re.sub(r"<[^>]+>", "", str(text))
+
+
 def send(chat_id, text, keyboard=None, preview=False):
-    return api(
-        "sendMessage",
-        chat_id=chat_id,
-        text=text,
-        parse_mode="HTML",
-        disable_web_page_preview=not preview,
-        reply_markup=json.dumps(keyboard, ensure_ascii=False) if keyboard else None,
-    )
+    """يرسل رسالة، وإن رفض تلغرام الصيغة يعيد المحاولة بصيغة أبسط
+    حتى لا يبقى أي رد بلا إجابة مهما كان السبب."""
+    # الأزرار يجب أن تكون كائناً (dict) لا نصاً
+    if isinstance(keyboard, str):
+        try:
+            keyboard = json.loads(keyboard)
+        except Exception:
+            keyboard = None
+    if keyboard is not None and not isinstance(keyboard, dict):
+        keyboard = None
+
+    # محاولة ①: كاملة (HTML + الأزرار)
+    attempts = []
+    if keyboard:
+        attempts.append({"parse_mode": "HTML", "reply_markup": keyboard})
+    attempts.append({"parse_mode": "HTML"})
+    # محاولة أخيرة: نص صافٍ بلا أي تنسيق
+    attempts.append({"__plain__": True})
+
+    result = {"ok": False, "description": "لم تُجرَّب أي محاولة"}
+    for idx, extra in enumerate(attempts):
+        kwargs = {
+            "chat_id": chat_id,
+            "text": _plain(text) if extra.get("__plain__") else text,
+            "disable_web_page_preview": not preview,
+            "_tries": 1,
+        }
+        if extra.get("parse_mode"):
+            kwargs["parse_mode"] = extra["parse_mode"]
+        if extra.get("reply_markup"):
+            kwargs["reply_markup"] = extra["reply_markup"]
+        result = api("sendMessage", **kwargs)
+        if result.get("ok"):
+            if idx > 0:
+                print(f"⚠️ تم الإرسال بصيغة احتياطية رقم {idx + 1}")
+            return result
+    return result
 
 
 def answer(cq_id, text=None, alert=False):
