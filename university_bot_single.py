@@ -558,7 +558,11 @@ if not WEBHOOK_URL:
             WEBHOOK_URL = _val if _val.startswith("http") else "https://" + _val
             break
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "uniguide-secret")
-WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/telegram")
+WEBHOOK_PATH = (os.getenv("WEBHOOK_PATH", "/telegram") or "/telegram").strip()
+if WEBHOOK_PATH and not WEBHOOK_PATH.startswith("/"):
+    WEBHOOK_PATH = "/" + WEBHOOK_PATH
+if not WEBHOOK_PATH:
+    WEBHOOK_PATH = "/telegram"
 PORT = int(os.getenv("PORT", "8080"))
 HOST = os.getenv("HOST", "0.0.0.0")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
@@ -1219,6 +1223,24 @@ def set_webhook():
         allowed_updates=["message", "callback_query"],
     )
     print(f"🔗 تم ربط الويب هوك: {url} -> {result.get('description', result)}")
+    # نتحقق فعليًا من الرابط المسجَّل عند تلغرام، وإن كان مختلفًا نعيد التسجيل
+    try:
+        info = api("getWebhookInfo").get("result", {}) or {}
+        current = (info.get("url") or "").strip()
+        print("🔎 الويب هوك المسجَّل عند تلغرام:", current or "(لا يوجد)")
+        if current != url:
+            print("♻️ الرابط المسجَّل مختلف — إعادة التسجيل على الرابط الصحيح...")
+            api("deleteWebhook", drop_pending_updates=False)
+            result2 = api(
+                "setWebhook",
+                url=url,
+                secret_token=WEBHOOK_SECRET,
+                drop_pending_updates=False,
+                allowed_updates=["message", "callback_query"],
+            )
+            print("🔗 إعادة التسجيل:", result2.get("description", result2))
+    except Exception as exc:  # لا نعطّل التشغيل بسبب التحقق
+        print("[webhook check warning]", exc)
 
 
 def delete_webhook():
@@ -1234,25 +1256,30 @@ class WebhookHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path in ("/", "/health", "/healthz"):
-            self._reply(200, "ok".encode())
-        else:
-            self._reply(404, "not found".encode())
+        # أي طلب فحص يعيد ok (يساعد على إبقاء الخدمة مستيقظة وعلى الفحص الصحي)
+        self._reply(200, "ok".encode())
 
     def do_POST(self):
-        if self.path != WEBHOOK_PATH:
-            self._reply(404, "not found".encode())
-            return
-        if self.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
+        # نستقبل التحديث على أي مسار: قد يختلف المسار المسجَّل في تلغرام عن
+        # المسار المحلي، وكان ذلك يرد "404" فتصل رسائل الناس ولا يردّ البوت.
+        path = self.path.split("?", 1)[0]
+        secret = self.headers.get("X-Telegram-Bot-Api-Secret-Token")
+        if secret and secret != WEBHOOK_SECRET:
+            print(f"[webhook] رُفض طلب على المسار {path}: التوقيع السري غير مطابق")
             self._reply(403, "forbidden".encode())
             return
         try:
             length = int(self.headers.get("Content-Length", 0))
-            update = json.loads(self.rfile.read(length).decode("utf-8"))
+            raw = self.rfile.read(length).decode("utf-8") if length else "{}"
+            update = json.loads(raw)
         except Exception as exc:
             print("[webhook parse error]", exc)
             self._reply(200)
             return
+        if not isinstance(update, dict) or "update_id" not in update:
+            self._reply(200)  # ليست رسالة تلغرام، نتجاهلها بهدوء
+            return
+        print(f"[webhook] وصل تحديث ({update.get('update_id')}) عبر المسار {path} -> يُعالج الآن ✅")
         threading.Thread(target=handle_update, args=(update,), daemon=True).start()
         self._reply(200)
 
@@ -1266,6 +1293,9 @@ def run_webhook():
     set_webhook()
     server = ThreadingHTTPServer((HOST, PORT), WebhookHandler)
     print(f"🌐 البوت يعمل بوضع الويب هوك على {HOST}:{PORT}{WEBHOOK_PATH}")
+    print(f"🧭 المسار الذي تُستقبل عليه الرسائل: {WEBHOOK_PATH}")
+    print(f"🔐 التوقيع السري مُفعَّل: {'نعم' if WEBHOOK_SECRET else 'لا'}")
+    print("✅ جاهز — أرسل /start الآن")
     server.serve_forever()
 
 
