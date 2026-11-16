@@ -1290,6 +1290,22 @@ def run_polling():
             time.sleep(3)
 
 
+# ---------------------------------------------------------------------- الأوامر
+def set_my_commands():
+    """يسجّل أوامر البوت بالعربية في واجهة تلغرام."""
+    commands = [
+        {"command": "start", "description": "القائمة الرئيسية"},
+        {"command": "help", "description": "تعليمات الاستخدام"},
+        {"command": "admin", "description": "لوحة تحكم المشرف"},
+        {"command": "id", "description": "عرض معرّف حسابك"},
+        {"command": "cancel", "description": "إلغاء أي إدخال حالي"},
+    ]
+    result = api("setMyCommands", commands=commands,
+                 scope={"type": "default"},
+                 language_code="ar")
+    print("⌨️", "تم تسجيل أوامر البوت" if result.get("ok") else "تعذّر تسجيل الأوامر")
+
+
 # ------------------------------------------------------------------- main loop
 def main():
     if not BOT_TOKEN:
@@ -1297,10 +1313,15 @@ def main():
             "⚠️ لم يتم ضبط BOT_TOKEN.\n"
             "شغّل البوت بالشكل: BOT_TOKEN=xxxx python bot.py"
         )
+    try:
+        set_my_commands()
+    except Exception as exc:  # لا نسمح لأي خطأ هنا بمنع تشغيل البوت
+        print("[commands warning]", exc)
     if WEBHOOK_URL:
         run_webhook()
     else:
         run_polling()
+
 
 if __name__ == "__main__":
     main()
