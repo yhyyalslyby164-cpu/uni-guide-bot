@@ -569,6 +569,53 @@ def count_students():
         return 0
 
 
+def get_student_by_id(record_id):
+    """يجلب سجل الطالب بمفتاحه الداخلي (id) — يُستخدم في بطاقة المشرف."""
+    try:
+        rows = _select("students", {"id": int(record_id)}, limit=1)
+    except Exception:
+        return None
+    return rows[0] if rows else None
+
+
+def find_students(query, limit=12):
+    """يبحث عن طالب بالاسم أو الرقم الجامعي أو المعرّف (بحث جزئي متسامح)."""
+    q = " ".join((query or "").split()).lower()
+    if not q:
+        return []
+    out = []
+    for s in list_students(limit=5000):
+        haystack = " ".join([
+            str(s.get("full_name") or ""),
+            str(s.get("uni_id") or ""),
+            str(s.get("user_id") or ""),
+            str(s.get("username") or ""),
+        ]).lower()
+        if q in haystack:
+            out.append(s)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def delete_student(record_id):
+    """يحذف سجل طالب واحد نهائيًا — للمشرف فقط."""
+    _delete("students", {"id": int(record_id)})
+    _cache_clear()
+    with _DIAG_LOCK:
+        DIAG["students"] = count_students()
+
+
+def delete_all_students():
+    """يحذف كل سجلات الطلاب — للمشرف فقط (يُطلب تأكيد صريح قبله)."""
+    before = count_students()
+    _delete_all("students")
+    _cache_clear()
+    with _DIAG_LOCK:
+        DIAG["students"] = count_students()
+    return before
+
+
 def all_chat_ids():
     """معرّفات المحادثات لإرسال البث — بلا تكرار ومرتّبة."""
     ids, seen = [], set()
@@ -1410,27 +1457,170 @@ def admin_menu():
     return text, kb
 
 
-def admin_students_screen():
-    """قائمة الطلاب المسجّلين مع ملخّص سريع."""
-    students = db.list_students(limit=300)
-    lines = ["👥 <b>بيانات الطلاب</b>", DIVIDER, "",
-             "عدد الطلاب المسجّلين: <b>" + str(len(students)) + "</b>", ""]
+STUDENTS_PER_PAGE = 8
+
+
+def _student_row_label(s):
+    """سطر واحد يصف الطالب: الاسم — الرقم الجامعي."""
+    nm = (s.get("full_name") or "").strip() or "بدون اسم"
+    un = (s.get("uni_id") or "").strip()
+    label = nm + (" — " + un if un else " — بلا رقم")
+    return label[:48]
+
+
+def admin_students_screen(page=0):
+    """قائمة الطلاب مع بحث وترقيم صفحات — ومنها الحذف."""
+    students = db.list_students(limit=5000)
+    total = len(students)
+    total_pages = max(1, (total + STUDENTS_PER_PAGE - 1) // STUDENTS_PER_PAGE)
+    page = max(0, min(int(page or 0), total_pages - 1))
+    start = page * STUDENTS_PER_PAGE
+    chunk = students[start:start + STUDENTS_PER_PAGE]
+
+    lines = [crumbs("لوحة التحكم", "الطلاب"), "👥 <b>إدارة الطلاب</b>", DIVIDER, ""]
+    lines.append("العدد الكلي: <b>" + str(total) + "</b>"
+                 + ("   •   صفحة " + str(page + 1) + " من " + str(total_pages) if total else ""))
+    lines.append("")
     if not students:
         lines.append("لا يوجد طلاب مسجّلون بعد.")
+        lines.append("<i>سيُضاف الطلاب تلقائيًا عند استخدامهم البوت أول مرة.</i>")
     else:
-        for i, s in enumerate(students[:25], 1):
-            nm = esc(s.get("full_name") or "—")
-            un = esc(s.get("uni_id") or "—")
+        lines.append("<i>اضغط على اسم الطالب لإدارته أو حذفه:</i>")
+        lines.append("")
+        for i, s in enumerate(chunk, start + 1):
+            un = (s.get("uni_id") or "").strip()
             yr = YEAR_TITLES.get(s.get("year"), "") if s.get("year") else ""
-            lines.append(f"{i}. {nm} • <code>{un}</code>" + (" • " + esc(yr) if yr else ""))
-        if len(students) > 25:
-            lines.append(f"\n<i>… و{len(students) - 25} طالبًا آخر — استخدم التصدير لرؤيتهم كلهم.</i>")
+            lines.append(f"{i}. {esc(s.get('full_name') or 'بدون اسم')}"
+                         + (" • <code>" + esc(un) + "</code>" if un else " • بلا رقم")
+                         + (" • " + esc(yr) if yr else ""))
+
+    # أزرار الطلاب (كل طالب في سطر)
+    rows = [[btn("👤 " + _student_row_label(s), "a:stu:" + str(s.get("id")))] for s in chunk]
+
+    # التنقّل بين الصفحات
+    nav = []
+    if page > 0:
+        nav.append(btn("⬅️ السابق", "a:students:%d" % (page - 1)))
+    if page < total_pages - 1:
+        nav.append(btn("التالي ➡️", "a:students:%d" % (page + 1)))
+    if nav:
+        rows.append(nav)
+
+    rows.append([btn("🔍 بحث عن طالب", "a:stusearch")])
+    rows.append([btn("📊 تصدير Excel", "a:export:xlsx"), btn("📄 تصدير CSV", "a:export:csv")])
+    rows.append([btn("📣 بث عام للجميع", "a:bc")])
+    if total:
+        rows.append([btn("🗑 حذف كل الطلاب", "a:studelall")])
+    rows.append([btn("⬅️ رجوع", "a:menu"), btn("🏠 الرئيسية", "menu")])
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def admin_student_card(record_id):
+    """بطاقة طالب واحد: بياناته كاملة + زر الحذف."""
+    s = db.get_student_by_id(record_id)
+    if not s:
+        return ("⚠️ هذا الطالب غير موجود (ربما حُذف بالفعل).",
+                {"inline_keyboard": [[btn("⬅️ رجوع إلى الطلاب", "a:students"),
+                                      btn("🏠 الرئيسية", "menu")]]})
+    lines = [crumbs("لوحة التحكم", "الطلاب", "بطاقة طالب"),
+             "👤 <b>" + esc(s.get("full_name") or "بدون اسم") + "</b>", DIVIDER, ""]
+    lines.append("🔢 الرقم الجامعي: " + ("<code>" + esc(s.get("uni_id")) + "</code>" if s.get("uni_id") else "— لم يُسجَّل —"))
+    lines.append("🎓 السنة: " + esc(YEAR_TITLES.get(s.get("year")) or "— لم تُحدَّد —"))
+    if s.get("username"):
+        lines.append("🔗 المعرف: @" + esc(s.get("username")))
+    lines.append("🆔 معرّف المحادثة: <code>" + esc(str(s.get("chat_id") or "—")) + "</code>")
+    lines.append("📅 انضم: " + esc(str(s.get("joined_at") or "—")[:19].replace("T", " ")))
+    if s.get("updated_at"):
+        lines.append("🔄 آخر تحديث: " + esc(str(s.get("updated_at") or "—")[:19].replace("T", " ")))
+    lines.append("")
+    lines.append("<i>إن ترك الطالب الجامعة أو الكلية، احذف سجله من هنا "
+                 "فيتوقف عن استقبال التعاميم.</i>")
+
+    rows = [[btn("🗑 حذف هذا الطالب", "a:studelask:" + str(record_id))]]
+    if s.get("chat_id"):
+        rows.append([btn("📣 إرسال رسالة له", "a:studm:" + str(record_id))])
+    rows.append([btn("⬅️ رجوع إلى الطلاب", "a:students"), btn("🏠 الرئيسية", "menu")])
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def admin_student_delete_confirm(record_id):
+    """تأكيد الحذف — خطوة أخيرة قبل الحذف النهائي."""
+    s = db.get_student_by_id(record_id)
+    if not s:
+        return ("⚠️ هذا الطالب غير موجود (ربما حُذف بالفعل).",
+                {"inline_keyboard": [[btn("⬅️ رجوع إلى الطلاب", "a:students")]]})
+    lines = [crumbs("لوحة التحكم", "الطلاب", "تأكيد الحذف"),
+             "🗑 <b>تأكيد حذف الطالب</b>", DIVIDER, "",
+             "👤 الاسم: <b>" + esc(s.get("full_name") or "بدون اسم") + "</b>",
+             "🔢 الرقم الجامعي: <b>" + esc(s.get("uni_id") or "—") + "</b>", ""]
+    lines.append("⚠️ <b>تأكيد نهائي:</b> سيُحذف سجله بالكامل ولن تصله أي رسالة "
+                 "أو تعميم بعد الآن.")
+    lines.append("<i>لا يمكن التراجع عن هذه الخطوة.</i>")
     rows = [
-        [btn("📊 تصدير Excel", "a:export:xlsx"), btn("📄 تصدير CSV", "a:export:csv")],
-        [btn("📣 بث عام للجميع", "a:bc")],
-        [btn("⬅️ رجوع", "a:menu"), btn("🏠 الرئيسية", "menu")],
+        [btn("✅ نعم، احذفه نهائيًا", "a:studelyes:" + str(record_id))],
+        [btn("❌ إلغاء", "a:stu:" + str(record_id))],
     ]
     return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def admin_students_search():
+    """يطلب من المشرف نص البحث عن طالب."""
+    lines = [crumbs("لوحة التحكم", "الطلاب", "بحث"),
+             "🔍 <b>البحث عن طالب</b>", DIVIDER, "",
+             "اكتب أي جزء من:",
+             "• اسم الطالب",
+             "• رقمه الجامعي",
+             "• معرّف حسابه (ID)", ""]
+    lines.append("<i>سأعرض لك كل من يطابق بحثك.</i>")
+    rows = [[btn("⬅️ رجوع إلى الطلاب", "a:students"), btn("🏠 الرئيسية", "menu")]]
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def admin_students_search_results(query):
+    """نتائج البحث: كل نتيجة مع زر لإدارة الطالب."""
+    results = db.find_students(query, limit=12)
+    lines = [crumbs("لوحة التحكم", "الطلاب", "نتائج البحث"),
+             "🔍 <b>نتائج البحث</b>", DIVIDER, "",
+             "بحثك: «<b>" + esc(query) + "</b>»",
+             "النتائج: <b>" + str(len(results)) + "</b>", ""]
+    if not results:
+        lines.append("❌ لا يوجد طالب مطابق.")
+        lines.append("<i>جرّب جزءًا من الاسم أو الرقم الجامعي.</i>")
+    else:
+        for i, s in enumerate(results, 1):
+            un = (s.get("uni_id") or "").strip()
+            lines.append(f"{i}. {esc(s.get('full_name') or 'بدون اسم')}"
+                         + (" • <code>" + esc(un) + "</code>" if un else ""))
+    rows = [[btn("👤 " + _student_row_label(s), "a:stu:" + str(s.get("id")))] for s in results]
+    rows.append([btn("🔍 بحث آخر", "a:stusearch")])
+    rows.append([btn("⬅️ رجوع إلى الطلاب", "a:students"), btn("🏠 الرئيسية", "menu")])
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def admin_students_delete_all_confirm():
+    """تأكيد حذف كل سجلات الطلاب (خطوة خطيرة)."""
+    total = db.count_students()
+    lines = [crumbs("لوحة التحكم", "الطلاب", "حذف الكل"),
+             "⚠️ <b>حذف كل سجلات الطلاب</b>", DIVIDER, "",
+             "العدد الحالي: <b>" + str(total) + "</b>", ""]
+    lines.append("سيُحذف <b>كل سجل طالب</b> في البوت نهائيًا.")
+    lines.append("✅ <b>لن تتأثّر</b> المقررات ولا الجداول ولا التخصصات ولا معلومات الجامعة.")
+    lines.append("")
+    lines.append("<b>متى تحتاج هذا؟</b> في نهاية عام دراسي أو عند بداية "
+                 "فصل جديد إن أردت قائمة طلاب نظيفة للفصل القادم.")
+    lines.append("")
+    lines.append("💾 <i>نصيحة: خذ نسخة احتياطية من «تصدير Excel» قبل الحذف.</i>")
+    rows = [
+        [btn("📊 تصدير Excel أولًا", "a:export:xlsx")],
+        [btn("✅ نعم، احذف الكل (" + str(total) + ")", "a:studelallyes")],
+        [btn("❌ إلغاء", "a:students")],
+    ]
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def is_registered_student(s):
+    """هل أكمل الطالب بياناته (اسم + رقم جامعي)؟"""
+    return bool((s.get("full_name") or "").strip() and (s.get("uni_id") or "").strip())
 
 
 def admin_broadcast_screen():
@@ -1812,7 +2002,46 @@ def admin_callback(chat_id, uid, data):
     elif kind == "specs":
         send(chat_id, *admin_year_screen(3))
     elif kind == "students":
+        page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+        send(chat_id, *admin_students_screen(page))
+    elif kind == "stu":
+        send(chat_id, *admin_student_card(int(parts[2])))
+    elif kind == "stusearch":
+        PENDING[uid] = ("student_search", None)
+        send(chat_id, *admin_students_search())
+    elif kind == "studelask":
+        send(chat_id, *admin_student_delete_confirm(int(parts[2])))
+    elif kind == "studelyes":
+        rec = int(parts[2])
+        s = db.get_student_by_id(rec)
+        name = (s.get("full_name") if s else "") or "بدون اسم"
+        uni = (s.get("uni_id") if s else "") or "—"
+        db.delete_student(rec)
+        send(chat_id,
+             "✅ <b>تم حذف الطالب</b>\n" + DIVIDER + "\n"
+             + "👤 " + esc(name) + "\n"
+             + "🔢 " + esc(uni) + "\n\n"
+             + "<i>لن تصله أي رسالة أو تعميم بعد الآن.</i>")
         send(chat_id, *admin_students_screen())
+    elif kind == "studelall":
+        send(chat_id, *admin_students_delete_all_confirm())
+    elif kind == "studelallyes":
+        before = db.delete_all_students()
+        send(chat_id,
+             "✅ <b>تم حذف كل سجلات الطلاب</b>\n" + DIVIDER + "\n"
+             + "🗑 المحذوف: <b>" + str(before) + "</b>\n\n"
+             + "✅ مقرراتك وجداولك ومعلومات الجامعة <b>لم تتأثّر</b>.")
+        send(chat_id, *admin_students_screen())
+    elif kind == "studm":
+        rec = int(parts[2])
+        s = db.get_student_by_id(rec)
+        if not s or not s.get("chat_id"):
+            send(chat_id, "⚠️ لا يمكن مراسلة هذا الطالب (لا يوجد معرّف محادثة).")
+        else:
+            PENDING[uid] = ("student_msg", rec)
+            send(chat_id, "✍️ <b>اكتب الرسالة</b> التي تريد إرسالها إلى «"
+                 + esc(s.get("full_name") or "الطالب") + "»:",
+                 {"inline_keyboard": [[btn("❌ إلغاء", "a:stu:" + str(rec))]]})
     elif kind == "export":
         fmt = parts[2] if len(parts) > 2 else ""
         if fmt in ("xlsx", "csv"):
@@ -2057,6 +2286,27 @@ def handle_text(msg):
         value = "" if text == "-" else text
         kind, meta = (pending if isinstance(pending, tuple) else (pending, None))
 
+        if kind == "student_search":
+            send(chat_id, *admin_students_search_results(value if value else "—"))
+            return
+        if kind == "student_msg":
+            rec = meta
+            s = db.get_student_by_id(rec)
+            if not s or not s.get("chat_id"):
+                send(chat_id, "⚠️ تعذّر الإرسال: الطالب غير موجود.")
+                return
+            res = send(s["chat_id"], value)
+            ok = not (isinstance(res, dict) and res.get("ok") is False)
+            if ok:
+                send(chat_id, "✅ تم إرسال الرسالة إلى «"
+                     + esc(s.get("full_name") or "الطالب") + "».",
+                     {"inline_keyboard": [[btn("⬅️ رجوع إلى الطلاب", "a:students")]]})
+            else:
+                send(chat_id, "⚠️ لم تُرسل الرسالة. غالبًا الطالب أوقف البوت (Block)، "
+                              "أو أن سجله قديم بلا محادثة صالحة.",
+                     {"inline_keyboard": [[btn("🗑 حذف هذا الطالب", "a:studelask:" + str(rec))],
+                                          [btn("⬅️ رجوع إلى الطلاب", "a:students")]]})
+            return
         if kind == "broadcast":
             if not text.strip():
                 send(chat_id, "⚠️ الرسالة فارغة، أعد المحاولة.")
@@ -2244,6 +2494,7 @@ def help_text():
         "🔎 <b>بحث عن مقرر</b> — اكتب أي جزء من اسم المقرر وسيظهر لك.\n"
         "⚙️ <b>إعداداتي</b> — عدّل اسمك ورقمك الجامعي وسنتك في أي وقت.\n"
         "📞 <b>تواصل معنا</b> — للاستفسارات والدعم.\n\n"
+
         + DIVIDER + "\n"
         "⌨️ <b>الأوامر</b>\n"
         "/start — القائمة الرئيسية\n"
@@ -2254,6 +2505,7 @@ def help_text():
         "/admin — لوحة التحكم (تعديل كل شيء من داخل تلغرام)\n"
         "/broadcast — إرسال تعميم لكل الطلاب\n"
         "/export — تنزيل بيانات الطلاب (Excel أو CSV)\n"
+        "/students — إدارة الطلاب (عرض/بحث/حذف طالب ترك الجامعة)\n"
         "/status — حالة البوت\n"
         "/testdb — فحص التخزين"
     )
@@ -2317,18 +2569,25 @@ def handle_update(update):
                     do_export(chat_id, fmt)
                 else:
                     send(chat_id, "🔐 هذا الأمر للمشرفين فقط.")
+            elif text.startswith("/students"):
+                if is_admin(uid):
+                    send(chat_id, *admin_students_screen())
+                else:
+                    PENDING[uid] = ("login_students", None)
+                    send(chat_id, "🔐 أرسل كلمة مرور المشرف لعرض الطلاب:")
             elif text.startswith("/admin"):
                 if is_admin(uid):
                     send(chat_id, *admin_menu())
                 else:
                     PENDING[uid] = ("login", None)
                     send(chat_id, "🔐 أرسل كلمة مرور المشرف:")
-            elif isinstance(PENDING.get(uid), tuple) and PENDING[uid][0] == "login":
+            elif isinstance(PENDING.get(uid), tuple) and PENDING[uid][0] in ("login", "login_students"):
+                login_kind = PENDING[uid][0]
                 PENDING.pop(uid, None)
                 if text == ADMIN_PASSWORD:
                     ADMIN_STATE.add(uid)
                     send(chat_id, "✅ تم تسجيل الدخول كمشرف.")
-                    send(chat_id, *admin_menu())
+                    send(chat_id, *(admin_students_screen() if login_kind == "login_students" else admin_menu()))
                 else:
                     send(chat_id, "❌ كلمة المرور غير صحيحة.")
             else:
