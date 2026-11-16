@@ -1297,7 +1297,7 @@ def main():
             "⚠️ لم يتم ضبط BOT_TOKEN.\n"
             "شغّل البوت بالشكل: BOT_TOKEN=xxxx python bot.py"
         )
-    set_my_commands()
+    set_my_commands()#
     if WEBHOOK_URL:
         run_webhook()
     else:
