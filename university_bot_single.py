@@ -1297,11 +1297,10 @@ def main():
             "⚠️ لم يتم ضبط BOT_TOKEN.\n"
             "شغّل البوت بالشكل: BOT_TOKEN=xxxx python bot.py"
         )
-      if WEBHOOK_URL:
+    if WEBHOOK_URL:
         run_webhook()
     else:
         run_polling()
-
 
 if __name__ == "__main__":
     main()
