@@ -599,6 +599,15 @@ SCHEDULE_FIELDS = [
     ("lectures_schedule_link", "رابط جدول المحاضرات"),
     ("exams_schedule_link", "رابط جدول الامتحانات"),
 ]
+# حقول مظهر البوت وإعداداته (يعدّلها المشرف من لوحة التحكم)
+BOT_FIELDS = [
+    ("bot_title", "عنوان القائمة الرئيسية"),
+    ("bot_subtitle", "سطر الترحيب"),
+    ("footer_text", "نص التذييل أسفل الرسائل"),
+    ("contact_link", "رابط التواصل / الدعم"),
+    ("channel_link", "رابط القناة الرسمية"),
+]
+
 COURSE_FIELDS = [
     ("lectures", "رابط المحاضرات"),
     ("practical", "رابط العملي"),
@@ -798,6 +807,14 @@ def btn(text, data):
     return {"text": text, "callback_data": data}
 
 
+def link_line(value):
+    """يعرض رابطًا كزر نصّي آمن (أو النص كما هو إن لم يكن رابطًا)."""
+    v = esc(value)
+    if re.match(r"^(https?://|tg://)", str(value).strip()):
+        return "<a href='" + str(value).strip() + "'>" + v + "</a>"
+    return v
+
+
 def links_block(pairs):
     """يبني سطور الروابط المتوفرة فقط."""
     lines = []
@@ -808,24 +825,66 @@ def links_block(pairs):
 
 
 # --------------------------------------------------------------------- screens
+DIVIDER = "━━━━━━━━━━━━━━━"
+
+
 def main_menu():
-    uni = db.get_setting("university_name")
-    title = f"🎓 <b>{esc(uni)}</b>\n\n" if uni else "🎓 <b>المرشد الجامعي</b>\n\n"
-    text = title + "مرحبًا بك! اختر القسم الذي تريده من القائمة التالية 👇"
-    kb = {
-        "inline_keyboard": [
-            [btn("📢 المعلومات العامة والتعاميم", "gen")],
-            [btn("📅 الجداول الدراسية والامتحانية", "sched")],
-            [btn("📘 السنة الأولى", "y:1"), btn("📗 السنة الثانية", "y:2")],
-            [btn("📙 السنة الثالثة", "y:3"), btn("📕 السنة الرابعة", "y:4")],
-            [btn("🔎 بحث عن مقرر", "search")],
-        ]
-    }
-    return text, kb
+    """القائمة الرئيسية — العنوان والترحيب والتذييل كلها قابلة للتعديل."""
+    title = db.get_setting("bot_title") or db.get_setting("university_name") or "المرشد الجامعي"
+    subtitle = db.get_setting("bot_subtitle") or "مرحبًا بك! اختر القسم الذي تريده 👇"
+    parts = ["🎓 <b>" + esc(title) + "</b>", DIVIDER, esc(subtitle)]
+    text = "\n".join(parts)
+    footer = db.get_setting("footer_text")
+    if footer:
+        text += "\n\n" + esc(footer)
+
+    rows = [
+        [btn("📢 المعلومات العامة والتعاميم", "gen")],
+        [btn("📅 الجداول الدراسية والامتحانية", "sched")],
+        [btn("📘 السنة الأولى", "y:1"), btn("📗 السنة الثانية", "y:2")],
+        [btn("📙 السنة الثالثة", "y:3"), btn("📕 السنة الرابعة", "y:4")],
+        [btn("🔎 بحث عن مقرر", "search")],
+    ]
+    extra = []
+    if db.get_setting("contact_link"):
+        extra.append(btn("📞 تواصل معنا", "contact"))
+    if db.get_setting("channel_link"):
+        extra.append(btn("📣 القناة الرسمية", "channel"))
+    if extra:
+        rows.append(extra)
+    return text, {"inline_keyboard": rows}
+
+
+def contact_screen():
+    """شاشة التواصل والقناة."""
+    lines = ["📞 <b>تواصل معنا</b>", DIVIDER, ""]
+    contact = db.get_setting("contact_link")
+    channel = db.get_setting("channel_link")
+    found = False
+    if contact:
+        lines.append("• الدعم والاستفسار: <a href='" + esc(contact) + "'>اضغط هنا</a>")
+        found = True
+    if channel:
+        lines.append("• القناة الرسمية: <a href='" + esc(channel) + "'>اضغط هنا</a>")
+        found = True
+    if not found:
+        lines.append("⚠️ لم تُضَف أي وسيلة تواصل بعد.")
+    return "\n".join(lines), {"inline_keyboard": [[btn("📣 القناة الرسمية", "channel")],
+                                                  [btn("⬅️ رجوع", "menu")]]}
+
+
+def channel_screen():
+    lines = ["📣 <b>القناة الرسمية</b>", DIVIDER, ""]
+    channel = db.get_setting("channel_link")
+    if channel:
+        lines.append("<a href='" + esc(channel) + "'>اضغط للانضمام إلى القناة</a>")
+    else:
+        lines.append("⚠️ لم يُضَف رابط القناة بعد.")
+    return "\n".join(lines), {"inline_keyboard": [[btn("⬅️ رجوع", "menu")]]}
 
 
 def general_screen():
-    lines = ["📢 <b>المعلومات العامة والتعاميم</b>", ""]
+    lines = ["📢 <b>المعلومات العامة والتعاميم</b>", DIVIDER, ""]
     body = links_block([(label, db.get_setting(key)) for key, label in GENERAL_FIELDS])
     lines.append(body if body else "⚠️ لم تُضَف أي معلومات بعد.")
     kb = {"inline_keyboard": [[btn("⬅️ رجوع", "menu")]]}
@@ -833,7 +892,7 @@ def general_screen():
 
 
 def schedule_screen():
-    lines = ["📅 <b>الجداول الدراسية والامتحانية</b>", ""]
+    lines = ["📅 <b>الجداول الدراسية والامتحانية</b>", DIVIDER, ""]
     body = links_block([(label, db.get_setting(key)) for key, label in SCHEDULE_FIELDS])
     lines.append(body if body else "⚠️ لم تُضَف أي جداول بعد.")
     kb = {"inline_keyboard": [[btn("⬅️ رجوع", "menu")]]}
@@ -841,7 +900,7 @@ def schedule_screen():
 
 
 def year_screen(year):
-    lines = [f"<b>{YEAR_TITLES[year]}</b>", ""]
+    lines = ["<b>" + YEAR_TITLES[year] + "</b>", DIVIDER, ""]
     group = db.get_year_group(year)
     if group:
         lines.append(f"👥 <a href='{esc(group)}'>رابط مجموعة السنة</a>")
@@ -875,7 +934,7 @@ def spec_screen(spec_id):
     spec = db.get_spec(spec_id)
     if not spec:
         return "⚠️ التخصص غير موجود.", {"inline_keyboard": [[btn("⬅️ رجوع", "menu")]]}
-    lines = [f"🎯 <b>{esc(spec['name'])}</b>", ""]
+    lines = ["🎯 <b>" + esc(spec["name"]) + "</b>", DIVIDER, ""]
     if spec["group_link"]:
         lines.append(f"👥 <a href='{esc(spec['group_link'])}'>رابط مجموعة التخصص</a>")
     else:
@@ -896,7 +955,7 @@ def course_screen(course_id):
     c = db.get_course(course_id)
     if not c:
         return "⚠️ المقرر غير موجود.", {"inline_keyboard": [[btn("⬅️ رجوع", "menu")]]}
-    lines = [f"📖 <b>{esc(c['name'])}</b>", ""]
+    lines = ["📖 <b>" + esc(c["name"]) + "</b>", DIVIDER, ""]
     if c["spec_id"]:
         spec = db.get_spec(c["spec_id"])
         lines.append(f"🎯 التخصص: {esc(spec['name']) if spec else '-'}")
@@ -918,12 +977,37 @@ def admin_menu():
             [btn("📘 الأولى", "a:y:1"), btn("📗 الثانية", "a:y:2")],
             [btn("📙 الثالثة", "a:y:3"), btn("📕 الرابعة", "a:y:4")],
             [btn("🎯 إدارة التخصصات", "a:specs")],
+            [btn("🎨 مظهر البوت واسمه", "a:bot")],
             [btn("💾 نسخة احتياطية", "a:backup"), btn("📥 استعادة نسخة", "a:restore")],
             [btn("🔍 فحص التخزين", "a:testdb"), btn("🩺 حالة البوت", "a:status")],
             [btn("👁 معاينة البوت", "menu")],
         ]
     }
     return text, kb
+
+
+def admin_bot_screen():
+    """شاشة تعديل مظهر البوت واسمه ونصوصه."""
+    title = db.get_setting("bot_title") or db.get_setting("university_name") or "المرشد الجامعي"
+    lines = ["🎨 <b>مظهر البوت وإعداداته</b>", DIVIDER, ""]
+    lines.append("العنوان الحالي: <b>" + esc(title) + "</b>")
+    lines.append("")
+    shown = False
+    for key, label in BOT_FIELDS:
+        val = (db.get_setting(key) or "").strip()
+        if not val:
+            continue
+        shown = True
+        if key in ("contact_link", "channel_link"):
+            lines.append("▫️ " + esc(label) + ": " + link_line(val))
+        else:
+            lines.append("▫️ " + esc(label) + ": " + esc(val))
+    if not shown:
+        lines.append("لا توجد نصوص مخصّصة بعد.")
+    rows = [[btn("✏️ " + label, "a:set:" + key)] for key, label in BOT_FIELDS]
+    rows.append([btn("↩️ استعادة الافتراضي", "a:resetbot")])
+    rows.append([btn("⬅️ رجوع", "a:menu")])
+    return "\n".join(lines), {"inline_keyboard": rows}
 
 
 def admin_gen_screen():
@@ -1018,6 +1102,10 @@ def handle_callback(cq):
     try:
         if data == "menu":
             send(chat_id, *main_menu())
+        elif data == "contact":
+            send(chat_id, *contact_screen())
+        elif data == "channel":
+            send(chat_id, *channel_screen())
         elif data == "gen":
             send(chat_id, *general_screen())
         elif data == "sched":
@@ -1051,6 +1139,13 @@ def admin_callback(chat_id, uid, data):
 
     if kind == "menu":
         send(chat_id, *admin_menu())
+    elif kind == "bot":
+        send(chat_id, *admin_bot_screen())
+    elif kind == "resetbot":
+        for key, _label in BOT_FIELDS:
+            db.set_setting(key, "")
+        send(chat_id, "✅ تمت استعادة المظهر الافتراضي.")
+        send(chat_id, *admin_bot_screen())
     elif kind == "status":
         send(chat_id, *status_text())
     elif kind == "testdb":
@@ -1071,7 +1166,7 @@ def admin_callback(chat_id, uid, data):
     # ------------------------------------------------------------ set values
     elif kind == "set":
         key = parts[2]
-        label = dict(GENERAL_FIELDS + SCHEDULE_FIELDS)[key]
+        label = dict(GENERAL_FIELDS + SCHEDULE_FIELDS + BOT_FIELDS)[key]
         ask_for_value(chat_id, uid, ("setting", key), f"✏️ تعديل: <b>{label}</b>")
     elif kind == "setyg":
         year = int(parts[2])
@@ -1225,6 +1320,8 @@ def handle_text(msg):
             send(chat_id, f"✅ تم الحفظ: {esc(value) or '—'}")
             if meta in dict(GENERAL_FIELDS):
                 send(chat_id, *admin_gen_screen())
+            elif meta in dict(BOT_FIELDS):
+                send(chat_id, *admin_bot_screen())
             else:
                 send(chat_id, *admin_sched_screen())
         elif kind == "year_group":
@@ -1377,16 +1474,24 @@ def test_db_text():
 
 # --------------------------------------------------------------------- update
 def help_text():
+    title = db.get_setting("bot_title") or "المرشد الجامعي"
     return (
-        "<b>مساعدة</b>\n\n"
+        "❓ <b>كيف تستخدم " + html.escape(title) + "؟</b>\n"
+        + DIVIDER + "\n\n"
+        "افتح القائمة الرئيسية بزر <b>🏠 القائمة</b> في أي وقت، ثم اختر ما تريد:\n\n"
+        "📢 <b>المعلومات العامة والتعاميم</b> — كل ما يخصّ الجامعة من إعلانات وروابط.\n"
+        "📅 <b>الجداول الدراسية والامتحانية</b> — مباشرةً من المصدر الرسمي.\n"
+        "📘📗📙📕 <b>السنوات الأربع</b> — مقررات كل سنة وروابط مجموعاتها.\n"
+        "🎯 <b>التخصصات</b> — تخصصات السنة الثالثة وتفاصيلها.\n"
+        "🔎 <b>بحث عن مقرر</b> — اكتب أي جزء من اسم المقرر وسيظهر لك.\n"
+        "📞 <b>تواصل معنا</b> — للاستفسارات والدعم.\n\n"
+        + DIVIDER + "\n"
+        "⌨️ <b>الأوامر</b>\n"
         "/start — القائمة الرئيسية\n"
-        "/admin — لوحة المشرف\n"
-        "/id — عرض معرّفك\n"
-        "/cancel — إلغاء أي إدخال\n"
-        "/status — حالة البوت\n"
-        "/testdb — فحص التخزين\n\n"
-        "تصفّح الأقسام من الأزرار: المعلومات العامة، الجداول، السنوات الأربع، والبحث.\n"
-        "المشرف يمكنه إضافة الروابط وتعديلها وحذفها من لوحة التحكم دون لمس الكود."
+        "/help — هذه المساعدة\n"
+        "/id — عرض معرّف حسابك\n"
+        "/cancel — إلغاء أي إدخال\n\n"
+        "🛠 <i>للمشرف:</i> /admin ثم كلمة المرور — يمكنك تعديل كل شيء من داخل تلغرام بلا لمس الكود."
     )
 
 
@@ -1676,14 +1781,37 @@ def run_polling():
 
 
 # ---------------------------------------------------------------------- الأوامر
+def set_bot_profile():
+    """يضبط اسم البوت ووصفه وترحيبه في واجهة تلغرام (قابل للتعطيل/التعديل)."""
+    name = (os.getenv("BOT_NAME") or "المرشد الجامعي").strip()
+    about = (os.getenv("BOT_ABOUT") or
+             "دليلك الجامعي الشامل: المعلومات العامة، الجداول الدراسية، "
+             "مقررات السنوات الأربع، والبحث عن أي مقرر — كل ذلك في مكان واحد."
+             ).strip()
+    short = (os.getenv("BOT_ABOUT_SHORT") or "دليلك الجامعي الشامل في مكان واحد 🎓").strip()
+    calls = [
+        ("setMyName", {"name": name[:64]}),
+        ("setMyDescription", {"description": about[:512]}),
+        ("setMyShortDescription", {"short_description": short[:120]}),
+    ]
+    done = 0
+    for method, params in calls:
+        try:
+            if api(method, **params).get("ok"):
+                done += 1
+        except Exception as exc:  # لا نُفشل التشغيل لأي سبب
+            print("[profile warning]", method, exc)
+    print("🎨", "تم ضبط اسم البوت ووصفه" if done else "تعذّر ضبط اسم البوت ووصفه")
+
+
 def set_my_commands():
     """يسجّل أوامر البوت بالعربية في واجهة تلغرام."""
     commands = [
-        {"command": "start", "description": "القائمة الرئيسية"},
-        {"command": "help", "description": "تعليمات الاستخدام"},
-        {"command": "admin", "description": "لوحة تحكم المشرف"},
-        {"command": "id", "description": "عرض معرّف حسابك"},
-        {"command": "cancel", "description": "إلغاء أي إدخال حالي"},
+        {"command": "start", "description": "🏠 القائمة الرئيسية"},
+        {"command": "help", "description": "❓ تعليمات الاستخدام"},
+        {"command": "id", "description": "🆔 عرض معرّف حسابك"},
+        {"command": "cancel", "description": "❌ إلغاء أي إدخال حالي"},
+        {"command": "admin", "description": "🛠 لوحة تحكم المشرف"},
     ]
     result = api("setMyCommands", commands=commands,
                  scope={"type": "default"},
@@ -1698,10 +1826,21 @@ def main():
             "⚠️ لم يتم ضبط BOT_TOKEN.\n"
             "شغّل البوت بالشكل: BOT_TOKEN=xxxx python bot.py"
         )
+    # تهيئة قاعدة البيانات والتخزين المحلي قبل أي شيء
     try:
+        os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+    except Exception:
+        pass
+    try:
+        db.init_db()
+        restore_from_env()
+    except Exception as exc:
+        print("[db init warning]", exc)
+    try:
+        set_bot_profile()
         set_my_commands()
     except Exception as exc:  # لا نسمح لأي خطأ هنا بمنع تشغيل البوت
-        print("[commands warning]", exc)
+        print("[profile/commands warning]", exc)
     if WEBHOOK_URL:
         run_webhook()
     else:
