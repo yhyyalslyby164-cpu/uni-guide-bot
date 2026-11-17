@@ -1104,6 +1104,10 @@ DIAG = {
     "last_db_error": None,
     "students": 0,
     "broadcast_sent": 0,
+    "keepalive_url": None,
+    "keepalive_last_ok": None,
+    "keepalive_last_error": None,
+    "keepalive_count": 0,
 }
 _DIAG_LOCK = threading.Lock()
 
@@ -3174,6 +3178,10 @@ def status_page():
             ('نجح ✅' if d.get('last_reply_ok') is True else
              (('فشل ❌ — ' + str(d.get('last_reply_error'))) if d.get('last_reply_ok') is False else 'لم يُرسل بعد')),
             d.get('last_reply_ok')),
+        row('حافظ اليقظة', d.get('keepalive_url') or 'غير مُفعّل (لا يوجد عنوان عام)'),
+        row('عدد النبضات', d.get('keepalive_count', 0)),
+        row('آخر نبضة ناجحة', d.get('keepalive_last_ok') or 'لم تُرسل بعد'),
+        row('آخر خطأ في النبضة', d.get('keepalive_last_error') or 'لا يوجد'),
     ]
 
     if d.get('storage_ok') is False:
@@ -3217,6 +3225,78 @@ def status_page():
             "<p style='color:#999;font-size:12px;margin-top:14px'>"
             "لا تُعرض هنا أي أسرار أو مفاتيح.</p></div></body></html>")
     return html.encode('utf-8')
+
+
+# ---- حافظ اليقظة (Keep-Alive) — يمنع ريندر من إنامة البوت ----------------
+# خدمة ريندر المجانية «تنام» عند غياب أي طلب قادم إليها. هذا الخيط يرسل
+# طلبًا دوريًا إلى عنوان الخدمة العام نفسه، فيبقى البوت مستيقظًا ويستجيب
+# فورًا بدل الانتظار للاستيقاظ. يعمل تلقائيًا، ويُعطَّل بوضع
+# KEEPALIVE_INTERVAL=0
+KEEPALIVE_INTERVAL = int(os.getenv("KEEPALIVE_INTERVAL", "300") or "300")
+_KEEPALIVE_STOP = threading.Event()
+
+
+def _keepalive_url():
+    """يبني عنوان الفحص العام، أو None إن لم يكن هناك عنوان عام متاح.
+
+    - العنوان المكتوب صريحًا في KEEPALIVE_URL يُحترم كما هو.
+    - وإلا نشتقّه من عنوان الخدمة، ونتجاهل العناوين المحلية تلقائيًا
+      حتى لا يُراسل البوت نفسه أثناء التطوير على الجهاز."""
+    explicit = (os.getenv("KEEPALIVE_URL", "") or "").strip()
+    base = (explicit or (WEBHOOK_URL or "")).strip().rstrip("/")
+    if not base.startswith("http"):
+        return None
+    if not explicit:
+        low = base.lower()
+        if "localhost" in low or "127.0.0.1" in low:
+            return None
+    for suffix in ("/health", "/healthz", "/ping", "/keepalive"):
+        if base.endswith(suffix):
+            return base
+    return base + "/health"
+
+
+def _keepalive_loop(url, interval):
+    import urllib.request
+    while not _KEEPALIVE_STOP.wait(interval):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "uniguide-keepalive"})
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                code = getattr(resp, "status", 200)
+            with _DIAG_LOCK:
+                DIAG["keepalive_last_ok"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                DIAG["keepalive_count"] = DIAG.get("keepalive_count", 0) + 1
+                DIAG["keepalive_last_error"] = None
+            print(f"[keepalive] ✅ نبضة ناجحة ({code}) — البوت مستيقظ")
+        except Exception as exc:
+            with _DIAG_LOCK:
+                DIAG["keepalive_last_error"] = str(exc)[:200]
+            print("[keepalive] ⚠️ تعذّرت النبضة:", str(exc)[:120])
+
+
+def start_keepalive():
+    """يشغّل خيط حافظ اليقظة إن كانت الإعدادات تسمح بذلك. لا يُفشل الإقلاع."""
+    try:
+        if KEEPALIVE_INTERVAL <= 0:
+            print("[keepalive] معطّل (KEEPALIVE_INTERVAL=0)")
+            return None
+        url = _keepalive_url()
+        if not url:
+            print("[keepalive] لا يوجد عنوان عام — حافظ اليقظة يتجاهل (طبيعي محليًا)")
+            return None
+        with _DIAG_LOCK:
+            DIAG["keepalive_url"] = url
+        th = threading.Thread(target=_keepalive_loop, args=(url, KEEPALIVE_INTERVAL), daemon=True)
+        th.start()
+        print(f"[keepalive] ✅ سيرسل نبضة إلى {url} كل {KEEPALIVE_INTERVAL} ثانية")
+        return th
+    except Exception as exc:  # لا نمنع تشغيل البوت أبدًا
+        print("[keepalive] warn:", exc)
+        return None
+
+
+def stop_keepalive():
+    _KEEPALIVE_STOP.set()
 
 
 def set_webhook():
@@ -3329,6 +3409,7 @@ def run_webhook():
     restore_from_env()
     preload_cache()
     check_token()
+    start_keepalive()
     set_webhook()
     server = ThreadingHTTPServer((HOST, PORT), WebhookHandler)
     print(f"🌐 البوت يعمل بوضع الويب هوك على {HOST}:{PORT}{WEBHOOK_PATH}")
@@ -3344,6 +3425,7 @@ def run_polling():
     restore_from_env()
     preload_cache()
     check_token()
+    start_keepalive()
     # إن كان هناك ويب هوك مسجَّل مسبقيًا فهو يمنع الاستقبال المباشر، لذا نزيله
     delete_webhook()
     print("🤖 البوت يعمل الآن بوضع الاستقبال المباشر... (Ctrl+C للإيقاف)")
