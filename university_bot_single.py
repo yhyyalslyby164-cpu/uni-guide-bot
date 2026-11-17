@@ -444,7 +444,9 @@ def set_setting(key, value):
 
 
 def all_settings():
-    return {r["key"]: r["value"] for r in _select("settings")}
+    """كل الإعدادات الظاهرة (بلا مفاتيح النظام الداخلية)."""
+    return {r["key"]: r["value"] for r in _select("settings")
+            if not str(r["key"]).startswith("_pending_")}
 
 
 # -------------------------------------------------------------- year groups
@@ -644,7 +646,8 @@ def export_data():
     """يرجع كل المحتوى كقاموس قابل للحفظ في ملف JSON."""
     return {
         "version": 1,
-        "settings": {r["key"]: r["value"] for r in _select("settings")},
+        "settings": {r["key"]: r["value"] for r in _select("settings")
+                     if not str(r["key"]).startswith("_pending_")},
         "year_groups": {str(r["year"]): r["group_link"]
                         for r in _select("year_groups")},
         "specializations": _select("specializations",
@@ -788,6 +791,68 @@ BOT_FIELDS = [
     ("channel_link", "رابط القناة الرسمية"),
 ]
 
+# ---- الملفات المرفوعة مباشرة إلى تلغرام -------------------------------------
+# عندما يرفع المشرف ملفًا (PDF/Word/صورة…) نخزّن «معرّف الملف» الذي يمنحه
+# تلغرام، ثم نعيد إرسال الملف نفسه للطالب لاحقًا. لا نحتاج تنزيله ولا رفعه
+# إلى أي خدمة تخزين، وهذا يتجاوز حدود الحجم تمامًا.
+TG_FILE_PREFIX = "tgfile:"
+
+
+def pack_tg_file(file_id, name=""):
+    """يخزّن معرّف الملف واسمه في قيمة واحدة قابلة للحفظ في قاعدة البيانات."""
+    return TG_FILE_PREFIX + str(file_id) + "|" + (name or "ملف")
+
+
+def unpack_tg_file(value):
+    """يفكّ القيمة: يعيد (file_id, name) إن كانت ملفًا مرفوعًا، وإلا None."""
+    v = str(value or "")
+    if not v.startswith(TG_FILE_PREFIX):
+        return None
+    body = v[len(TG_FILE_PREFIX):]
+    if "|" in body:
+        fid, name = body.split("|", 1)
+    else:
+        fid, name = body, "ملف"
+    fid = fid.strip()
+    if not fid:
+        return None
+    return fid, (name.strip() or "ملف")
+
+
+def is_tg_file(value):
+    return unpack_tg_file(value) is not None
+
+
+def send_tg_file(chat_id, file_id, caption="", keyboard=None):
+    """يعيد إرسال ملف مرفوع مسبقًا للطالب/المشرف — بلا تنزيل ولا رفع."""
+    kwargs = {"chat_id": chat_id, "document": file_id}
+    if caption:
+        kwargs["caption"] = caption
+        kwargs["parse_mode"] = "HTML"
+    if keyboard:
+        kwargs["reply_markup"] = keyboard
+    return api("sendDocument", **kwargs)
+
+
+def _deliver_group_file(chat_id, label, value, keyboard=None):
+    """يُسلّم ملف/رابط مجموعة السنة أو التخصص للطالب."""
+    packed = unpack_tg_file(value)
+    if packed:
+        fid, fname = packed
+        res = send_tg_file(chat_id, fid,
+                           caption=f"👥 <b>{esc(label)}</b>\n📎 {esc(fname)}\n\n"
+                                   "<i>احفظ الملف عندك للرجوع إليه لاحقًا.</i>",
+                           keyboard=keyboard)
+        if isinstance(res, dict) and res.get("ok") is False:
+            send(chat_id, "⚠️ تعذّر إرسال الملف — غالبًا حُذف من خدمة تلغرام.\n"
+                          "أبلغ المشرف ليعيد رفعه.", keyboard)
+        return
+    if value:
+        send(chat_id, f"👥 <a href='{esc(value)}'>{esc(label)}</a>", keyboard)
+    else:
+        send(chat_id, "⚠️ غير متوفر حاليًا.", keyboard)
+
+
 COURSE_FIELDS = [
     ("theory", "📖 محاضرات نظرية"),
     ("labs", "💻 مخابر عملي"),
@@ -803,6 +868,55 @@ COURSE_MAIN_FIELDS = ("theory", "labs", "past")
 # الذاكرة المؤقتة: من ينتظر إدخال قيمة، وماذا ينتظر بالضبط
 PENDING = {}
 ADMIN_STATE = set()
+
+# نحفظ «سياق التعديل» مؤقتًا في قاعدة البيانات كذلك، حتى لا يضيع
+# إذا أُعيد تشغيل الخدمة بين ضغط المشرف للحقل ورفعه للملف.
+_PENDING_TTL = 6 * 3600  # ست ساعات
+
+
+def save_pending(uid, action):
+    """يحفظ السياق في الذاكرة وفي قاعدة البيانات معًا (حماية من إعادة التشغيل)."""
+    PENDING[uid] = action
+    try:
+        _upsert("settings", {"key": "_pending_" + str(uid),
+                             "value": json.dumps(action, ensure_ascii=False)},
+                ["key"])
+        _cache_clear()
+    except Exception as exc:  # لا نُفشل العملية بسبب الحفظ الاحتياطي
+        print("[save_pending warn]", exc)
+
+
+def load_pending(uid):
+    """يستعيد السياق (من الذاكرة أولًا، ثم من قاعدة البيانات)."""
+    if uid in PENDING:
+        return PENDING[uid]
+    try:
+        raw = dict((r["key"], r["value"]) for r in _select("settings")).get(
+            "_pending_" + str(uid))
+    except Exception:
+        raw = None
+    if not raw:
+        return None
+    try:
+        action = json.loads(raw)
+    except Exception:
+        return None
+    if isinstance(action, list):
+        action = tuple(action)
+        if len(action) == 2 and isinstance(action[1], list):
+            action = (action[0], tuple(action[1]))
+    PENDING[uid] = action
+    return action
+
+
+def clear_pending(uid):
+    """يمسح السياق من الذاكرة ومن قاعدة البيانات."""
+    PENDING.pop(uid, None)
+    try:
+        _delete("settings", {"key": "_pending_" + str(uid)})
+        _cache_clear()
+    except Exception:
+        pass
 
 # ------------------------------------------------------------------ تشخيص
 DIAG = {
@@ -1135,11 +1249,29 @@ def link_line(value):
     return v
 
 
+def group_link_block(label, value, owner_cb):
+    """يبني سطر «رابط المجموعة» مع زر تنزيل إن كان الملف مرفوعًا.
+
+    يعيد (نص السطر, زر التنزيل أو None)."""
+    packed = unpack_tg_file(value)
+    if packed:
+        return (f"👥 <b>{esc(label)}:</b> 📎 {esc(packed[1])}",
+                btn("📥 عرض " + label, owner_cb))
+    if value:
+        return (f"👥 <a href='{esc(value)}'>{esc(label)}</a>", None)
+    return (f"👥 {esc(label)}: غير متوفر", None)
+
+
 def links_block(pairs):
-    """يبني سطور الروابط المتوفرة فقط."""
+    """يبني سطور الروابط/الملفات المتوفرة فقط."""
     lines = []
     for label, value in pairs:
-        if value:
+        if not value:
+            continue
+        packed = unpack_tg_file(value)
+        if packed:
+            lines.append(f"▫️ {label}: 📎 {esc(packed[1])}")
+        else:
             lines.append(f"▫️ {label}: <a href='{esc(value)}'>{esc(value)}</a>")
     return "\n".join(lines)
 
@@ -1263,11 +1395,9 @@ def schedule_screen():
 def year_screen(year):
     """شاشة السنة: مقرراتها (أو تخصصاتها في السنة الثالثة) + عودة سريعة."""
     lines = [crumbs(YEAR_TITLES[year]), "<b>" + YEAR_TITLES[year] + "</b>", DIVIDER, ""]
-    group = db.get_year_group(year)
-    if group:
-        lines.append(f"👥 <a href='{esc(group)}'>رابط مجموعة السنة</a>")
-    else:
-        lines.append("👥 رابط مجموعة السنة: غير متوفر")
+    gl_line, gl_btn = group_link_block("رابط مجموعة السنة", db.get_year_group(year),
+                                       f"gl:y:{year}")
+    lines.append(gl_line)
     lines.append("")
 
     if year == 3:
@@ -1278,7 +1408,10 @@ def year_screen(year):
         lines.append("🎯 <b>التخصصات المتاحة:</b>")
         lines.append("<i>اضغط على تخصصك ليظهر لك مقرراته فقط.</i>")
         # كل تخصص في سطر مستقل — لا تُخلط المقررات هنا أبدًا
-        rows = [[btn(f"🎯 {s['name']}", f"sp:{s['id']}")] for s in specs]
+        rows = []
+        if gl_btn:
+            rows.append([gl_btn])
+        rows += [[btn(f"🎯 {s['name']}", f"sp:{s['id']}")] for s in specs]
         rows.append(go_home_row())
         return "\n".join(lines), {"inline_keyboard": rows}
 
@@ -1289,7 +1422,10 @@ def year_screen(year):
         lines.append("📚 <b>المقررات:</b>")
         for i, c in enumerate(courses, 1):
             lines.append(f"{i}. {esc(c['name'])}")
-    rows = [[btn(f"📖 {c['name']}", f"c:{c['id']}")] for c in courses]
+    rows = []
+    if gl_btn:
+        rows.append([gl_btn])
+    rows += [[btn(f"📖 {c['name']}", f"c:{c['id']}")] for c in courses]
     rows.append(go_home_row())
     return "\n".join(lines), {"inline_keyboard": rows}
 
@@ -1300,10 +1436,9 @@ def spec_screen(spec_id):
         return "⚠️ التخصص غير موجود.", {"inline_keyboard": [go_home_row()]}
     lines = [crumbs(YEAR_TITLES[3], "تخصص: " + spec["name"]),
              "🎯 <b>" + esc(spec["name"]) + "</b>", DIVIDER, ""]
-    if spec["group_link"]:
-        lines.append(f"👥 <a href='{esc(spec['group_link'])}'>رابط مجموعة التخصص</a>")
-    else:
-        lines.append("👥 رابط مجموعة التخصص: غير متوفر")
+    gl_line, gl_btn = group_link_block("رابط مجموعة التخصص", spec["group_link"],
+                                       f"gl:sp:{spec_id}")
+    lines.append(gl_line)
     lines.append("")
     lines.append("📚 <b>مقررات تخصص «" + esc(spec["name"]) + "»:</b>")
     courses = db.list_courses(3, spec_id)   # مقررات هذا التخصص فقط
@@ -1312,7 +1447,10 @@ def spec_screen(spec_id):
     else:
         for i, c in enumerate(courses, 1):
             lines.append(f"{i}. {esc(c['name'])}")
-    rows = [[btn(f"📖 {c['name']}", f"c:{c['id']}")] for c in courses]
+    rows = []
+    if gl_btn:
+        rows.append([gl_btn])
+    rows += [[btn(f"📖 {c['name']}", f"c:{c['id']}")] for c in courses]
     rows.append(go_home_row())
     return "\n".join(lines), {"inline_keyboard": rows}
 
@@ -1339,27 +1477,73 @@ def course_screen(course_id):
     found_any = False
     for key, label in COURSE_FIELDS:
         val = (c.get(key) or "").strip()
-        if val:
-            found_any = True
+        if not val:
+            continue
+        found_any = True
+        packed = unpack_tg_file(val)
+        if packed:
+            lines.append(f"▫️ {esc(label)}: 📎 {esc(packed[1])}")
+        else:
             lines.append(f"▫️ {esc(label)}: <a href='{esc(val)}'>اضغط هنا</a>")
     if not found_any:
         lines.append("<i>⚠️ لم تُضَف ملفات لهذا المقرر بعد.</i>")
 
     rows = []
     for key, label in COURSE_FIELDS:
-        if (c.get(key) or "").strip():
-            rows.append([btn(label, f"f:{course_id}:{key}")])
+        val = (c.get(key) or "").strip()
+        if val:
+            mark = "📎" if unpack_tg_file(val) else "🔗"
+            rows.append([btn(mark + " " + label, f"f:{course_id}:{key}")])
     rows.append([btn("⬅️ رجوع إلى المقررات", f"y:{c['year']}" if not c.get("spec_id") else f"sp:{c['spec_id']}")])
     rows.append(go_home_row())
     return "\n".join(lines), {"inline_keyboard": rows}
 
 
+def _deliver_course_file(chat_id, course_id, field, back_label="⬅️ رجوع إلى المقرر"):
+    """يُسلّم ملف المقرر للطالب: ملف مرفوع مباشرةً، أو رابط يُفتح.
+
+    هذه الدالة ترسل الملف نفسه في المحادثة عندما يكون مرفوعًا إلى تلغرام،
+    أو تعرض زرًا للرابط إن كان المشرف قد وضع رابطًا خارجيًا."""
+    c = db.get_course(course_id)
+    label = dict(COURSE_FIELDS).get(field, "الملف")
+    if not c or not (c.get(field) or "").strip():
+        send(chat_id, "⚠️ هذا الملف غير متوفر حاليًا.",
+             {"inline_keyboard": [[btn(back_label, f"c:{course_id}")], go_home_row()]})
+        return
+    value = str(c.get(field) or "").strip()
+    caption = ("🔗 <b>" + label + "</b>\n" + DIVIDER + "\n📖 المقرر: <b>"
+               + esc(c["name"]) + "</b>")
+    packed = unpack_tg_file(value)
+    if packed:
+        fid, fname = packed
+        res = send_tg_file(chat_id, fid,
+                           caption=caption + "\n\n<i>احفظ الملف عندك للرجوع إليه لاحقًا.</i>",
+                           keyboard={"inline_keyboard": [[btn(back_label, f"c:{course_id}")],
+                                                         go_home_row()]})
+        if not (isinstance(res, dict) and res.get("ok") is False):
+            return
+        # إن فشل الإرسال (ملف قديم محذوف من تلغرام) نُعلم بوضوح بدل الصمت
+        send(chat_id,
+             "⚠️ تعذّر إرسال الملف المرفوع — غالبًا حُذف من خدمة تلغرام.\n"
+             "أبلغ المشرف ليعيد رفع الملف.",
+             {"inline_keyboard": [[btn(back_label, f"c:{course_id}")], go_home_row()]})
+        return
+    # رابط خارجي عادي
+    lines = [crumbs(YEAR_TITLES.get(c["year"], "-")), "🔗 <b>" + esc(label) + "</b>",
+             DIVIDER, "", "📖 المقرر: <b>" + esc(c["name"]) + "</b>", "",
+             "<a href='" + esc(value) + "'>اضغط هنا لفتح الملف</a>"]
+    rows = [[btn(back_label, f"c:{course_id}")], go_home_row()]
+    send(chat_id, "\n".join(lines), {"inline_keyboard": rows})
+
+
 def course_file_screen(course_id, field):
-    """يفتح رابط ملف المقرر داخل تلغرام، مع بقاء التنقّل واضحًا."""
+    """يعرض تفاصيل ملف المقرر مع إمكانية تسليمه مباشرة."""
     c = db.get_course(course_id)
     label = dict(COURSE_FIELDS).get(field, "الملف")
     if not c or not (c.get(field) or "").strip():
         return "⚠️ هذا الملف غير متوفر حاليًا.", {"inline_keyboard": [go_home_row()]}
+    value = str(c.get(field) or "").strip()
+    packed = unpack_tg_file(value)
     path = [YEAR_TITLES.get(c["year"], "-")]
     if c.get("spec_id"):
         spec = db.get_spec(c["spec_id"])
@@ -1367,9 +1551,17 @@ def course_file_screen(course_id, field):
             path.append("تخصص: " + spec["name"])
     path.append(c["name"])
     lines = [crumbs(*path), "🔗 <b>" + esc(label) + "</b>", DIVIDER, "",
-             "📖 المقرر: <b>" + esc(c["name"]) + "</b>", "",
-             "<a href='" + esc(c[field]) + "'>اضغط هنا لفتح الملف</a>"]
-    rows = [[btn("⬅️ رجوع إلى المقرر", f"c:{course_id}")], go_home_row()]
+             "📖 المقرر: <b>" + esc(c["name"]) + "</b>", ""]
+    if packed:
+        fid, fname = packed
+        lines.append("📎 الملف: <b>" + esc(fname) + "</b>")
+        lines.append("<i>اضغط الزر لعرض الملف داخل المحادثة.</i>")
+        rows = [[btn("📥 عرض الملف", f"df:{course_id}:{field}")]]
+    else:
+        lines.append("🔗 <a href='" + esc(value) + "'>اضغط هنا لفتح الملف</a>")
+        rows = []
+    rows.append([btn("⬅️ رجوع إلى المقرر", f"c:{course_id}")])
+    rows.append(go_home_row())
     return "\n".join(lines), {"inline_keyboard": rows}
 
 
@@ -1737,7 +1929,15 @@ def admin_course_screen(course_id):
         return "⚠️ غير موجود.", {"inline_keyboard": [[btn("⬅️ رجوع", "a:menu")]]}
     lines = [f"📖 <b>{esc(c['name'])}</b>", ""]
     for key, label in COURSE_FIELDS:
-        lines.append(f"{label}: {esc(c[key]) or '—'}")
+        val = str(c[key] or "").strip()
+        packed = unpack_tg_file(val)
+        if packed:
+            show = "📎 " + packed[1]
+        elif val:
+            show = val
+        else:
+            show = "—"
+        lines.append(f"{label}: {esc(show) if not packed else show}")
     back = f"a:asp:{c['spec_id']}" if c["spec_id"] else f"a:y:{c['year']}"
     rows = [[btn("✏️ الاسم", f"a:ecn:{course_id}")]]
     # كل تصنيف في سطر: 📖 نظري | 💻 مخابر | 📝 دورات سابقة | الملفات
@@ -1766,7 +1966,7 @@ def admin_move_course_screen(course_id):
 
 
 def ask_for_value(chat_id, uid, action, prompt):
-    PENDING[uid] = action
+    save_pending(uid, action)
     send(
         chat_id,
         prompt + "\n\nأرسل القيمة الآن (أو /cancel للإلغاء، أو أرسل ‎-‎ للتفريغ).",
@@ -1868,6 +2068,23 @@ def handle_callback(cq):
         elif data.startswith("f:"):
             _, cid, field = data.split(":", 2)
             send(chat_id, *course_file_screen(int(cid), field))
+        elif data.startswith("df:"):
+            _, cid, field = data.split(":", 2)
+            _deliver_course_file(chat_id, int(cid), field,
+                                 back_label="⬅️ رجوع إلى الملف")
+        elif data.startswith("gl:"):
+            parts = data.split(":")
+            if parts[1] == "y":
+                year = int(parts[2])
+                _deliver_group_file(chat_id, "رابط مجموعة " + YEAR_TITLES.get(year, ""),
+                                    db.get_year_group(year),
+                                    {"inline_keyboard": [[btn("⬅️ رجوع", f"y:{year}")], go_home_row()]})
+            elif parts[1] == "sp":
+                sid = int(parts[2])
+                spec = db.get_spec(sid)
+                if spec:
+                    _deliver_group_file(chat_id, "رابط مجموعة " + spec["name"], spec["group_link"],
+                                        {"inline_keyboard": [[btn("⬅️ رجوع", f"sp:{sid}")], go_home_row()]})
         elif data == "me:reg":
             start_registration(chat_id, uid, (db.get_student(uid) or {}).get("username", ""))
         elif data == "skipreg":
@@ -2119,7 +2336,15 @@ def admin_callback(chat_id, uid, data):
     elif kind == "ecl":
         cid, field = int(parts[2]), parts[3]
         label = dict(COURSE_FIELDS)[field]
-        ask_for_value(chat_id, uid, ("course_link", (cid, field)), f"✏️ تعديل: {label}")
+        save_pending(uid, ("course_link", (cid, field)))
+        send(chat_id,
+             f"✏️ <b>تعديل: {esc(label)}</b>\n{DIVIDER}\n\n"
+             "يمكنك الآن أحد أمرين:\n"
+             "📎 <b>ارفع الملف مباشرة</b> — ملف PDF/Word، صورة، مقطع فيديو، "
+             "أو حتى تسجيل صوتي — وسيُحفظ ويظهر للطلاب.\n"
+             "🔗 أو <b>أرسل رابطًا</b> نصيًا (Google Drive مثلاً).\n\n"
+             "أو أرسل ‎-‎ للتفريغ، و /cancel للإلغاء.",
+             {"inline_keyboard": [[btn("❌ إلغاء", f"a:ec:{cid}")]]})
     elif kind == "dc":
         cid = int(parts[2])
         c = db.get_course(cid)
@@ -2158,7 +2383,12 @@ def search_courses(query):
 
 
 def handle_document(msg):
-    """يستقبل ملف النسخة الاحتياطية من المشرف ويستعيد المحتوى."""
+    """يستقبل الملفات التي يرسلها المشرف.
+
+    حالتان:
+      1) أثناء تعديل «ملف/رابط مقرر» → نحفظ الملف المرفوع نفسه ونعيد إرساله
+         للطالب لاحقًا (بلا تنزيل ولا رفع). هذا ما يجعل زر «📎 ارفع ملف» يعمل.
+      2) خلاف ذلك → ملف نسخة احتياطية JSON لاستعادة المحتوى."""
     uid = msg["from"]["id"]
     chat_id = msg["chat"]["id"]
     doc = msg.get("document") or {}
@@ -2167,9 +2397,67 @@ def handle_document(msg):
         send(chat_id, "🔐 غير مسموح.")
         return
 
-    name = doc.get("file_name", "")
+    name = doc.get("file_name", "") or "ملف"
+    pending = load_pending(uid)
+
+    # ---------- الحالة 1: المشرف يضيف ملفًا لأحد الحقول التي تعدّل الآن ----------
+    if isinstance(pending, tuple) and pending[0] in ("course_link", "setting",
+                                                     "year_group", "spec_link"):
+        fid = doc.get("file_id")
+        if not fid:
+            send(chat_id, "⚠️ لم يصل الملف، حاول مرة أخرى.")
+            return
+        size = int(doc.get("file_size") or 0)
+        if size and size > 50 * 1024 * 1024:
+            hint_kb = ([[btn("⬅️ رجوع", f"a:ec:{pending[1][0]}")]]
+                       if pending[0] == "course_link" else None)
+            send(chat_id,
+                 "⚠️ حجم الملف أكبر من 50 ميغابايت، وهو الحد الأقصى الذي يسمح به تلغرام.\n\n"
+                 "💡 الحل: اضغط الملف (ZIP أو PDF مضغوط) ثم ارفعه مجددًا، "
+                 "أو ضعه على Google Drive وأرسل الرابط النصي بدلًا من الملف.",
+                 {"inline_keyboard": hint_kb} if hint_kb else None)
+            return
+        clear_pending(uid)
+        kind = pending[0]
+        packed = pack_tg_file(fid, name)
+
+        if kind == "course_link":
+            cid, field = pending[1]
+            label = dict(COURSE_FIELDS).get(field, "الملف")
+            db.update_course(cid, **{field: packed})
+            send(chat_id,
+                 "✅ <b>تم حفظ الملف بنجاح!</b>\n\n"
+                 f"▫️ الحقل: {esc(label)}\n"
+                 f"▫️ الملف: 📎 {esc(name)}\n\n"
+                 "<i>سيستطيع الطالب الآن عرض الملف وتنزيله مباشرة من داخل البوت.</i>",
+                 {"inline_keyboard": [[btn("⬅️ رجوع إلى المقرر", f"a:ec:{cid}")]]})
+            return
+        if kind == "setting":
+            db.set_setting(pending[1], packed)
+            send(chat_id, "✅ <b>تم حفظ الملف بنجاح!</b>\n▫️ 📎 " + esc(name))
+            if pending[1] in dict(GENERAL_FIELDS):
+                send(chat_id, *admin_gen_screen())
+            elif pending[1] in dict(BOT_FIELDS):
+                send(chat_id, *admin_bot_screen())
+            else:
+                send(chat_id, *admin_sched_screen())
+            return
+        if kind == "year_group":
+            db.set_year_group(pending[1], packed)
+            send(chat_id, "✅ <b>تم حفظ الملف بنجاح!</b>\n▫️ 📎 " + esc(name))
+            send(chat_id, *admin_year_screen(pending[1]))
+            return
+        if kind == "spec_link":
+            db.update_spec(pending[1], group_link=packed)
+            send(chat_id, "✅ <b>تم حفظ الملف بنجاح!</b>\n▫️ 📎 " + esc(name))
+            send(chat_id, *admin_spec_screen(pending[1]))
+            return
+
+    # ---------- الحالة 2: نسخة احتياطية JSON ----------
     if not (name.endswith(".json") or doc.get("mime_type") == "application/json"):
-        send(chat_id, "⚠️ أرسل ملف JSON فقط (ملف النسخة الاحتياطية).")
+        send(chat_id,
+             "⚠️ أرسل ملف JSON فقط (ملف النسخة الاحتياطية).\n\n"
+             "💡 لإضافة ملف لمقرر: افتح المقرر ← اختر الحقل ← ثم ارفع الملف هنا.")
         return
 
     raw = download_file(doc["file_id"])
@@ -2194,17 +2482,66 @@ def handle_document(msg):
     )
 
 
+
+def _extract_media(msg):
+    """يستخرج (file_id, name, size) من أي وسائط أرسلها المشرف.
+
+    يدعم: مستند، صورة، فيديو، تسجيل صوتي/مرئي — كلها تُحفظ بنفس الطريقة
+    وتُعاد إرسالها للطالب من مخزن تلغرام بلا تنزيل ولا رفع."""
+    if msg.get("document"):
+        d = msg["document"]
+        return d.get("file_id"), (d.get("file_name") or "ملف"), int(d.get("file_size") or 0)
+    if msg.get("photo"):
+        # أعلى دقة هي أكبر مقاس
+        p = max(msg["photo"], key=lambda x: int(x.get("file_size") or x.get("width") or 0))
+        return p.get("file_id"), "صورة", int(p.get("file_size") or 0)
+    for key, default in (("video", "مقطع فيديو"), ("audio", "تسجيل صوتي"),
+                         ("voice", "رسالة صوتية"), ("animation", "صورة متحركة")):
+        if msg.get(key):
+            m = msg[key]
+            name = m.get("file_name") or default
+            return m.get("file_id"), name, int(m.get("file_size") or 0)
+    return None, "ملف", 0
+
+
+def handle_media(msg):
+    """يحفظ الوسائط التي يرفعها المشرف في الحقل الذي يُعدّله الآن.
+
+    يشمل: الصور، الفيديوهات، وتسجيلات المحاضرات الصوتية — وهذا مهم
+    لأن حقل «🎧 تسجيلات المحاضرات» يُرفع فيه غالبًا ملف صوت أو فيديو."""
+    uid = msg["from"]["id"]
+    chat_id = msg["chat"]["id"]
+    if not is_admin(uid):
+        send(chat_id, "🔐 غير مسموح.")
+        return
+
+    # نتصرّف كما لو كان مستندًا: نبني رسالة متوافقة ونمرّرها للمعالج نفسه
+    fid, name, size = _extract_media(msg)
+    if not fid:
+        send(chat_id, "⚠️ لم يصل الملف، حاول مرة أخرى.")
+        return
+    synthetic = {
+        "from": msg["from"],
+        "chat": msg["chat"],
+        "document": {"file_id": fid, "file_name": name,
+                     "mime_type": "", "file_size": size},
+        "_is_media": True,
+    }
+    handle_document(synthetic)
+
+
 def handle_text(msg):
     uid = msg["from"]["id"]
     chat_id = msg["chat"]["id"]
     text = (msg.get("text") or "").strip()
 
     if text.startswith("/cancel"):
-        PENDING.pop(uid, None)
+        clear_pending(uid)
         send(chat_id, "تم الإلغاء.", {"inline_keyboard": [[btn("🏠 القائمة", "menu")]]})
         return
 
-    pending = PENDING.pop(uid, None)
+    pending = load_pending(uid)
+    clear_pending(uid)
     if not pending:
         send(chat_id, "استخدم القائمة 👇", {"inline_keyboard": [[btn("🏠 القائمة الرئيسية", "menu")]]})
         return
@@ -2524,6 +2861,10 @@ def handle_update(update):
 
             if msg.get("document"):
                 handle_document(msg)
+                return
+            if msg.get("photo") or msg.get("video") or msg.get("audio") \
+                    or msg.get("voice") or msg.get("animation"):
+                handle_media(msg)
                 return
 
             text = (msg.get("text") or "").strip()
