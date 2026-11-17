@@ -30,6 +30,13 @@ import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+# httpx اختياري: عند توفّره نستخدمه لإعادة استخدام الاتصالات (Keep-Alive)
+# وهذا يقلّل زمن كل نداء كثيرًا. وإن لم يكن مثبّتًا يعمل البوت بـ urllib عادةً.
+try:
+    import httpx as _httpx
+except Exception:  # pragma: no cover
+    _httpx = None
+
 
 # ==================== طبقة قاعدة البيانات ====================
 # ------------------------------------------------------------ اختيار الوضع
@@ -104,7 +111,9 @@ SCHEMA_SQLITE = """
 
 
 # ======================================================= ذاكرة مؤقتة سريعة
-_CACHE_TTL = float(os.getenv("DB_CACHE_TTL", "15"))
+_CACHE_TTL = float(os.getenv("DB_CACHE_TTL", "300"))
+_CACHE_PRELOAD = (os.getenv("DB_CACHE_PRELOAD", "1").strip().lower()
+                  not in ("0", "false", "no", "off"))
 _CACHE = {}
 _LOCK = threading.Lock()
 
@@ -127,6 +136,106 @@ def _cache_put(key, value):
 def _cache_clear():
     with _LOCK:
         _CACHE.clear()
+
+
+def _cache_drop(key):
+    with _LOCK:
+        _CACHE.pop(key, None)
+
+
+def preload_cache():
+    """يحمّل البيانات الثابتة إلى الذاكرة مرة واحدة عند الإقلاع.
+
+    بعد ذلك كل نقرات الزر تُخدَم من الذاكرة فورًا (بلا نداء شبكة)،
+    وتُحدَّث تلقائيًا فقط عند قيام المشرف بأي تعديل."""
+    if not _CACHE_PRELOAD:
+        return
+    started = time.time()
+    try:
+        all_settings()
+        for year in YEARS:
+            get_year_group(year)
+            list_courses(year)
+        list_courses(3)
+        specs = list_specs()
+        for s in specs:
+            list_courses(3, s["id"])
+        print("[cache] ✅ تم تحميل البيانات الثابتة مسبقًا (%.2f ث)" % (time.time() - started))
+    except Exception as exc:  # لا نُفشل الإقلاع أبدًا بسبب الكاش
+        print("[cache preload warn]", exc)
+
+
+# ============================== طبقة اتصال مشتركة (مجمّع اتصالات)
+# الهدف: عدم فتح اتصال TCP/TLS جديد مع كل ضغطة زر. نستخدم عميلًا واحدًا
+# يعيد استخدام الاتصالات (Keep-Alive) ويشاركه كل الخيوط — آمن وخيطيًا.
+_HTTP_CLIENT = None
+_HTTP_LOCK = threading.Lock()
+_HTTP_POOL = int(os.getenv("HTTP_POOL_SIZE", "40") or "40")
+_HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "30") or "30")
+
+
+def _get_http_client():
+    """يرجع عميل httpx مشتركًا (أو None إن لم تتوفر المكتبة)."""
+    global _HTTP_CLIENT
+    if _httpx is None:
+        return None
+    if _HTTP_CLIENT is None:
+        with _HTTP_LOCK:
+            if _HTTP_CLIENT is None:
+                try:
+                    limits = _httpx.Limits(
+                        max_connections=_HTTP_POOL,
+                        max_keepalive_connections=max(10, _HTTP_POOL // 2),
+                        keepalive_expiry=30.0,
+                    )
+                    _HTTP_CLIENT = _httpx.Client(
+                        timeout=_httpx.Timeout(_HTTP_TIMEOUT, connect=10.0),
+                        limits=limits,
+                        follow_redirects=True,
+                        headers={"Connection": "keep-alive"},
+                    )
+                except Exception as exc:  # pragma: no cover
+                    print("[http] تعذّر إنشاء عميل httpx، سنستخدم urllib:", exc)
+                    _HTTP_CLIENT = None
+    return _HTTP_CLIENT
+
+
+def _http_perform(method, url, headers=None, content=None, timeout=None):
+    """ينفّذ طلب HTTP واحد ويرجع (الحالة, النص). لا يرفع استثناءً على 4xx/5xx.
+
+    يستخدم الاتصال المشترك إن توفّر httpx، وإلا يعود إلى urllib."""
+    timeout = timeout or _HTTP_TIMEOUT
+    client = _get_http_client()
+    if client is not None:
+        resp = client.request(method, url, headers=headers or None,
+                              content=content, timeout=timeout)
+        return resp.status_code, resp.text
+    req = urllib.request.Request(url, data=content,
+                                 headers=headers or {}, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.getcode(), resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        try:
+            body = exc.read().decode("utf-8", "replace")
+        except Exception:
+            body = ""
+        return exc.code, body
+
+
+def _http_perform_raw(method, url, headers=None, timeout=None):
+    """مثل _http_perform لكن يعيد البايتات (لتنزيل الملفات)."""
+    timeout = timeout or _HTTP_TIMEOUT
+    client = _get_http_client()
+    if client is not None:
+        resp = client.request(method, url, headers=headers or None, timeout=timeout)
+        return resp.status_code, resp.content
+    req = urllib.request.Request(url, headers=headers or {}, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.getcode(), resp.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, b""
 
 
 # ================================================== طبقة SQLite (محلي)
@@ -270,27 +379,22 @@ def _supa_request(method, path, params=None, body=None, prefer=None, retries=3):
     }
     if prefer:
         headers["Prefer"] = prefer
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
-
     last = None
     for attempt in range(max(1, retries)):
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                raw = resp.read().decode("utf-8")
+            code, raw = _http_perform(method, url, headers=headers, content=data)
+            if 200 <= code < 300:
                 return json.loads(raw) if raw.strip() else []
-        except urllib.error.HTTPError as exc:
-            detail = ""
-            try:
-                detail = exc.read().decode("utf-8", "replace")[:300]
-            except Exception:
-                pass
-            last = RuntimeError("Supabase %s %s -> %s %s" % (method, path, exc.code, detail))
-            if exc.code < 500:
+            detail = (raw or "")[:300]
+            last = RuntimeError("Supabase %s %s -> %s %s" % (method, path, code, detail))
+            if code < 500:          # خطأ دائم (مفتاح/جدول): لا فائدة من إعادة المحاولة
                 raise last
-        except Exception as exc:  # مشاكل شبكة مؤقتة
+        except RuntimeError:
+            raise
+        except Exception as exc:    # مشاكل شبكة مؤقتة
             last = exc
         if attempt < retries - 1:
-            time.sleep(1)
+            time.sleep(0.4 * (attempt + 1))   # تراجع سريع بدل انتظار ثابت
     raise last if last else RuntimeError("Supabase request failed")
 
 
@@ -445,14 +549,25 @@ def set_setting(key, value):
 
 def all_settings():
     """كل الإعدادات الظاهرة (بلا مفاتيح النظام الداخلية)."""
-    return {r["key"]: r["value"] for r in _select("settings")
+    hit = _cache_get(("all_settings",))
+    if hit is not None:
+        return hit
+    data = {r["key"]: r["value"] for r in _select("settings")
             if not str(r["key"]).startswith("_pending_")}
+    _cache_put(("all_settings",), data)
+    return data
 
 
 # -------------------------------------------------------------- year groups
 def get_year_group(year):
+    key = ("ygroup", int(year))
+    hit = _cache_get(key)
+    if hit is not None:
+        return hit
     rows = _select("year_groups", {"year": int(year)}, limit=1)
-    return rows[0]["group_link"] if rows else ""
+    value = rows[0]["group_link"] if rows else ""
+    _cache_put(key, value)
+    return value
 
 
 def set_year_group(year, link):
@@ -462,12 +577,23 @@ def set_year_group(year, link):
 
 # ----------------------------------------------------------- specializations
 def list_specs():
-    return _select("specializations", order=[("position", "asc"), ("id", "asc")])
+    hit = _cache_get(("specs",))
+    if hit is not None:
+        return hit
+    rows = _select("specializations", order=[("position", "asc"), ("id", "asc")])
+    _cache_put(("specs",), rows)
+    return rows
 
 
 def get_spec(spec_id):
+    key = ("spec", int(spec_id))
+    hit = _cache_get(key)
+    if hit is not None:
+        return hit
     rows = _select("specializations", {"id": int(spec_id)}, limit=1)
-    return rows[0] if rows else None
+    row = rows[0] if rows else None
+    _cache_put(key, row)
+    return row
 
 
 def add_spec(name, group_link=""):
@@ -492,14 +618,26 @@ def delete_spec(spec_id):
 
 # ------------------------------------------------------------------ courses
 def list_courses(year, spec_id=None):
+    key = ("courses", int(year), None if spec_id is None else int(spec_id))
+    hit = _cache_get(key)
+    if hit is not None:
+        return hit
     filters = {"year": int(year),
                "spec_id": None if spec_id is None else int(spec_id)}
-    return _select("courses", filters, order=[("position", "asc"), ("id", "asc")])
+    rows = _select("courses", filters, order=[("position", "asc"), ("id", "asc")])
+    _cache_put(key, rows)
+    return rows
 
 
 def get_course(course_id):
+    key = ("course", int(course_id))
+    hit = _cache_get(key)
+    if hit is not None:
+        return hit
     rows = _select("courses", {"id": int(course_id)}, limit=1)
-    return rows[0] if rows else None
+    row = rows[0] if rows else None
+    _cache_put(key, row)
+    return row
 
 
 def add_course(year, spec_id, name, **fields):
@@ -735,7 +873,10 @@ if db is None:  # حالة تحميل غير اعتيادي: ننشئ مساحة
 
 
 # --------------------------------------------------------------------- config
-BOT_TOKEN = (os.getenv("BOT_TOKEN", "") or "").strip().strip('"').strip("'").strip()
+BOT_TOKEN = (os.getenv("BOT_TOKEN", "")
+             or os.getenv("TELEGRAM_BOT_TOKEN", "")
+             or os.getenv("TELEGRAM_TOKEN", "")
+             or "").strip().strip('"').strip("'").strip()
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()
 
 # كشف عنوان الاستضافة تلقائيًا (Render / Railway / Koyeb) ليعمل الويب هوك بلا إعداد يدوي
@@ -797,18 +938,32 @@ BOT_FIELDS = [
 # إلى أي خدمة تخزين، وهذا يتجاوز حدود الحجم تمامًا.
 TG_FILE_PREFIX = "tgfile:"
 
+# نوع الملف: صورة تُرسَل بـ sendPhoto، وما عداها بـ sendDocument.
+MEDIA_PHOTO = "photo"
+MEDIA_DOC = "doc"
 
-def pack_tg_file(file_id, name=""):
-    """يخزّن معرّف الملف واسمه في قيمة واحدة قابلة للحفظ في قاعدة البيانات."""
-    return TG_FILE_PREFIX + str(file_id) + "|" + (name or "ملف")
+
+def pack_tg_file(file_id, name="", media=MEDIA_DOC):
+    """يخزّن معرّف الملف واسمه ونوعه في قيمة واحدة قابلة للحفظ في القاعدة.
+
+    الصيغة: tgfile:<kind>|<file_id>|<name>"""
+    kind = MEDIA_PHOTO if str(media or "").lower() == MEDIA_PHOTO else MEDIA_DOC
+    return (TG_FILE_PREFIX + kind + "|" + str(file_id) + "|"
+            + (name or "ملف").replace("|", " "))
 
 
 def unpack_tg_file(value):
-    """يفكّ القيمة: يعيد (file_id, name) إن كانت ملفًا مرفوعًا، وإلا None."""
+    """يفكّ القيمة ويعيد (file_id, name, media) إن كان ملفًا مرفوعًا، وإلا None."""
     v = str(value or "")
     if not v.startswith(TG_FILE_PREFIX):
         return None
     body = v[len(TG_FILE_PREFIX):]
+    media = MEDIA_DOC
+    if body.startswith(MEDIA_PHOTO + "|"):
+        media = MEDIA_PHOTO
+        body = body[len(MEDIA_PHOTO) + 1:]
+    elif body.startswith(MEDIA_DOC + "|"):
+        body = body[len(MEDIA_DOC) + 1:]
     if "|" in body:
         fid, name = body.split("|", 1)
     else:
@@ -816,33 +971,44 @@ def unpack_tg_file(value):
     fid = fid.strip()
     if not fid:
         return None
-    return fid, (name.strip() or "ملف")
+    return fid, (name.strip() or "ملف"), media
 
 
 def is_tg_file(value):
     return unpack_tg_file(value) is not None
 
 
-def send_tg_file(chat_id, file_id, caption="", keyboard=None):
-    """يعيد إرسال ملف مرفوع مسبقًا للطالب/المشرف — بلا تنزيل ولا رفع."""
-    kwargs = {"chat_id": chat_id, "document": file_id}
-    if caption:
-        kwargs["caption"] = caption
-        kwargs["parse_mode"] = "HTML"
-    if keyboard:
-        kwargs["reply_markup"] = keyboard
-    return api("sendDocument", **kwargs)
+def send_tg_file(chat_id, file_id, caption="", keyboard=None, media=MEDIA_DOC):
+    """يعيد إرسال ملف مرفوع مسبقًا للطالب/المشرف — بلا تنزيل ولا رفع.
+
+    الصور تُرسَل بـ sendPhoto كي تظهر داخل المحادثة، وإن فشل ذلك نتراجع
+    إلى sendDocument (بعض معرّفات الصور القديمة لا تعمل مع sendPhoto)."""
+    def _call(method, field):
+        kwargs = {"chat_id": chat_id, field: file_id}
+        if caption:
+            kwargs["caption"] = caption
+            kwargs["parse_mode"] = "HTML"
+        if keyboard:
+            kwargs["reply_markup"] = keyboard
+        return api(method, **kwargs)
+
+    if media == MEDIA_PHOTO:
+        res = _call("sendPhoto", "photo")
+        if isinstance(res, dict) and res.get("ok") is False:
+            res = _call("sendDocument", "document")
+        return res
+    return _call("sendDocument", "document")
 
 
 def _deliver_group_file(chat_id, label, value, keyboard=None):
     """يُسلّم ملف/رابط مجموعة السنة أو التخصص للطالب."""
     packed = unpack_tg_file(value)
     if packed:
-        fid, fname = packed
+        fid, fname, media = packed
         res = send_tg_file(chat_id, fid,
                            caption=f"👥 <b>{esc(label)}</b>\n📎 {esc(fname)}\n\n"
                                    "<i>احفظ الملف عندك للرجوع إليه لاحقًا.</i>",
-                           keyboard=keyboard)
+                           keyboard=keyboard, media=media)
         if isinstance(res, dict) and res.get("ok") is False:
             send(chat_id, "⚠️ تعذّر إرسال الملف — غالبًا حُذف من خدمة تلغرام.\n"
                           "أبلغ المشرف ليعيد رفعه.", keyboard)
@@ -881,7 +1047,7 @@ def save_pending(uid, action):
         _upsert("settings", {"key": "_pending_" + str(uid),
                              "value": json.dumps(action, ensure_ascii=False)},
                 ["key"])
-        _cache_clear()
+        _cache_drop(("all_settings",))
     except Exception as exc:  # لا نُفشل العملية بسبب الحفظ الاحتياطي
         print("[save_pending warn]", exc)
 
@@ -914,7 +1080,7 @@ def clear_pending(uid):
     PENDING.pop(uid, None)
     try:
         _delete("settings", {"key": "_pending_" + str(uid)})
-        _cache_clear()
+        _cache_drop(("all_settings",))
     except Exception:
         pass
 
@@ -944,36 +1110,36 @@ _DIAG_LOCK = threading.Lock()
 
 # ---------------------------------------------------------------- telegram API
 def api(method, **params):
+    """نداء واحد إلى واجهة تلغرام، عبر الاتصال المُعاد استخدامه إن توفّر."""
     url = API.format(token=BOT_TOKEN, method=method)
     tries = int(params.pop("_tries", 3))
     # نتجاهل أي قيمة فارغة (None) حتى لا يرفضها تلغرام
     params = {k: v for k, v in params.items() if v is not None}
     data = json.dumps(params, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    headers = {"Content-Type": "application/json"}
     last = None
     for attempt in range(max(1, tries)):
         try:
-            with urllib.request.urlopen(req, timeout=70) as resp:
-                result = json.loads(resp.read().decode("utf-8"))
-            if method in ("sendMessage", "editMessageText"):
-                with _DIAG_LOCK:
-                    DIAG["last_reply_ok"] = bool(result.get("ok"))
-                    DIAG["last_reply_error"] = None if result.get("ok") else str(
-                        result.get("description", "غير معروف"))
-                    if not result.get("ok"):
-                        print("⚠️ فشل إرسال الرد:", result.get("description"))
-            return result
-        except urllib.error.HTTPError as exc:
-            last = f"HTTP {exc.code}"
+            code, raw = _http_perform("POST", url, headers=headers, content=data,
+                                      timeout=70)
             try:
-                body = json.loads(exc.read().decode("utf-8"))
-                last = str(body.get("description", last))
+                result = json.loads(raw) if raw.strip() else {"ok": False}
             except Exception:
-                pass
+                result = {"ok": False, "description": raw[:200]}
+            if 200 <= code < 300:
+                if method in ("sendMessage", "editMessageText"):
+                    with _DIAG_LOCK:
+                        DIAG["last_reply_ok"] = bool(result.get("ok"))
+                        DIAG["last_reply_error"] = None if result.get("ok") else str(
+                            result.get("description", "غير معروف"))
+                        if not result.get("ok"):
+                            print("⚠️ فشل إرسال الرد:", result.get("description"))
+                return result
+            last = "HTTP %s %s" % (code, result.get("description", ""))
         except Exception as exc:  # pragma: no cover
             last = f"{type(exc).__name__}: {exc}"
         if attempt < max(1, tries) - 1:
-            time.sleep(2)
+            time.sleep(1)
     print("[api error]", method, last)
     if method in ("sendMessage", "editMessageText"):
         with _DIAG_LOCK:
@@ -1207,8 +1373,11 @@ def download_file(file_id):
     path = info["result"]["file_path"]
     url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{path}"
     try:
-        with urllib.request.urlopen(url, timeout=70) as resp:
-            return resp.read()
+        code, body = _http_perform_raw("GET", url, timeout=70)
+        if 200 <= code < 300:
+            return body
+        print("[getFile error] HTTP", code)
+        return None
     except Exception as exc:  # pragma: no cover
         print("[getFile error]", exc)
         return None
@@ -1515,11 +1684,12 @@ def _deliver_course_file(chat_id, course_id, field, back_label="⬅️ رجوع 
                + esc(c["name"]) + "</b>")
     packed = unpack_tg_file(value)
     if packed:
-        fid, fname = packed
+        fid, fname, media = packed
         res = send_tg_file(chat_id, fid,
                            caption=caption + "\n\n<i>احفظ الملف عندك للرجوع إليه لاحقًا.</i>",
                            keyboard={"inline_keyboard": [[btn(back_label, f"c:{course_id}")],
-                                                         go_home_row()]})
+                                                         go_home_row()]},
+                           media=media)
         if not (isinstance(res, dict) and res.get("ok") is False):
             return
         # إن فشل الإرسال (ملف قديم محذوف من تلغرام) نُعلم بوضوح بدل الصمت
@@ -1553,7 +1723,7 @@ def course_file_screen(course_id, field):
     lines = [crumbs(*path), "🔗 <b>" + esc(label) + "</b>", DIVIDER, "",
              "📖 المقرر: <b>" + esc(c["name"]) + "</b>", ""]
     if packed:
-        fid, fname = packed
+        fid, fname, _media = packed
         lines.append("📎 الملف: <b>" + esc(fname) + "</b>")
         lines.append("<i>اضغط الزر لعرض الملف داخل المحادثة.</i>")
         rows = [[btn("📥 عرض الملف", f"df:{course_id}:{field}")]]
@@ -2392,6 +2562,7 @@ def handle_document(msg):
     uid = msg["from"]["id"]
     chat_id = msg["chat"]["id"]
     doc = msg.get("document") or {}
+    media_kind = msg.get("_media_kind") or MEDIA_DOC
 
     if not is_admin(uid):
         send(chat_id, "🔐 غير مسموح.")
@@ -2419,7 +2590,7 @@ def handle_document(msg):
             return
         clear_pending(uid)
         kind = pending[0]
-        packed = pack_tg_file(fid, name)
+        packed = pack_tg_file(fid, name, media_kind)
 
         if kind == "course_link":
             cid, field = pending[1]
@@ -2484,24 +2655,25 @@ def handle_document(msg):
 
 
 def _extract_media(msg):
-    """يستخرج (file_id, name, size) من أي وسائط أرسلها المشرف.
+    """يستخرج (file_id, name, size, media) من أي وسائط أرسلها المشرف.
 
-    يدعم: مستند، صورة، فيديو، تسجيل صوتي/مرئي — كلها تُحفظ بنفس الطريقة
-    وتُعاد إرسالها للطالب من مخزن تلغرام بلا تنزيل ولا رفع."""
+    يدعم: مستند، صورة، فيديو، تسجيل صوتي/مرئي. الصور تُعلَّم كـ photo كي
+    تُرسَل لاحقًا بـ sendPhoto (تظهر داخل المحادثة)، وبقية الأنواع كمستند."""
     if msg.get("document"):
         d = msg["document"]
-        return d.get("file_id"), (d.get("file_name") or "ملف"), int(d.get("file_size") or 0)
+        return (d.get("file_id"), (d.get("file_name") or "ملف"),
+                int(d.get("file_size") or 0), MEDIA_DOC)
     if msg.get("photo"):
         # أعلى دقة هي أكبر مقاس
         p = max(msg["photo"], key=lambda x: int(x.get("file_size") or x.get("width") or 0))
-        return p.get("file_id"), "صورة", int(p.get("file_size") or 0)
+        return p.get("file_id"), "صورة", int(p.get("file_size") or 0), MEDIA_PHOTO
     for key, default in (("video", "مقطع فيديو"), ("audio", "تسجيل صوتي"),
                          ("voice", "رسالة صوتية"), ("animation", "صورة متحركة")):
         if msg.get(key):
             m = msg[key]
             name = m.get("file_name") or default
-            return m.get("file_id"), name, int(m.get("file_size") or 0)
-    return None, "ملف", 0
+            return m.get("file_id"), name, int(m.get("file_size") or 0), MEDIA_DOC
+    return None, "ملف", 0, MEDIA_DOC
 
 
 def handle_media(msg):
@@ -2516,7 +2688,7 @@ def handle_media(msg):
         return
 
     # نتصرّف كما لو كان مستندًا: نبني رسالة متوافقة ونمرّرها للمعالج نفسه
-    fid, name, size = _extract_media(msg)
+    fid, name, size, media = _extract_media(msg)
     if not fid:
         send(chat_id, "⚠️ لم يصل الملف، حاول مرة أخرى.")
         return
@@ -2526,6 +2698,7 @@ def handle_media(msg):
         "document": {"file_id": fid, "file_name": name,
                      "mime_type": "", "file_size": size},
         "_is_media": True,
+        "_media_kind": media,
     }
     handle_document(synthetic)
 
@@ -3092,7 +3265,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        # صفحة الحالة (تشخيص) + أي طلب فحص آخر يعيد ok
+        # صفحة الحالة (تشخيص) + مسارات الفحص (Keep-Alive) لمنع نوم الخدمة
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
         if path in ("/status", "/diag", "/check"):
             page = status_page()
@@ -3101,6 +3274,24 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(page)))
             self.end_headers()
             self.wfile.write(page)
+            return
+        if path in ("/", "/health", "/healthz", "/ping", "/keepalive", "/webhook"):
+            # رد JSON بسيط: يمنع Render من إنامة الخدمة عند غياب المستخدمين
+            with _DIAG_LOCK:
+                payload = {
+                    "status": "active",
+                    "message": "Bot is awake and running smoothly!",
+                    "mode": DIAG.get("mode"),
+                    "received_updates": DIAG.get("received_updates", 0),
+                    "last_received_at": DIAG.get("last_received_at"),
+                    "running_since": DIAG.get("started_at"),
+                }
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
             return
         self._reply(200, "ok".encode())
 
@@ -3136,6 +3327,7 @@ def run_webhook():
     DIAG["mode"] = "وضع الويب هوك (Webhook)"
     db.init_db()
     restore_from_env()
+    preload_cache()
     check_token()
     set_webhook()
     server = ThreadingHTTPServer((HOST, PORT), WebhookHandler)
@@ -3150,6 +3342,7 @@ def run_polling():
     DIAG["mode"] = "الاستقبال المباشر (Polling)"
     db.init_db()
     restore_from_env()
+    preload_cache()
     check_token()
     # إن كان هناك ويب هوك مسجَّل مسبقيًا فهو يمنع الاستقبال المباشر، لذا نزيله
     delete_webhook()
