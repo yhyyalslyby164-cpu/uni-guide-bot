@@ -1450,7 +1450,7 @@ def links_block(pairs):
 
 
 # --------------------------------------------------------------------- screens
-DIVIDER = "━━━━━━━━━━━━━━━"
+DIVIDER = ""   # المظهر الكلاسيكي القديم لا يستخدم خطًا فاصلًا
 
 
 # ------------------------------------------------------------------ breadcrumb
@@ -1480,34 +1480,19 @@ def grid(buttons, per_row=2):
 
 
 def main_menu(uid=None):
-    """القائمة الرئيسية — أزرار مرتّبة في شبكة 2×2 مريحة من الهاتف."""
-    title = db.get_setting("bot_title") or db.get_setting("university_name") or "المرشد الجامعي"
-    subtitle = db.get_setting("bot_subtitle") or "مرحبًا بك! اختر القسم الذي تريده 👇"
-    student = db.get_student(uid) if uid else None
+    """القائمة الرئيسية — المظهر الكلاسيكي: عنوان بسيط وكل قسم رئيسي في سطر واضح."""
+    uni = db.get_setting("university_name") or db.get_setting("bot_title")
+    title = "🎓 <b>" + esc(uni) + "</b>" if uni else "🎓 <b>المرشد الجامعي</b>"
+    text = title + "\n\nمرحبًا بك! اختر القسم الذي تريده من القائمة التالية 👇"
 
-    parts = ["🎓 <b>" + esc(title) + "</b>", DIVIDER]
-    if student and student.get("full_name"):
-        parts.append("👋 أهلًا " + esc(student["full_name"]) +
-                     (" • " + esc(student.get("uni_id")) if student.get("uni_id") else ""))
-    parts.append(esc(subtitle))
-    text = "\n".join(parts)
-    footer = db.get_setting("footer_text")
-    if footer:
-        text += "\n\n" + esc(footer)
-
-    # (1) شبكة 2×2 للأقسام الأساسية — كل صف زرّان متساويان
-    grid_buttons = [
-        btn("📢 المعلومات العامة", "gen"),
-        btn("📅 الجداول الدراسية", "sched"),
-        btn("📘 السنة الأولى", "y:1"),
-        btn("📗 السنة الثانية", "y:2"),
-        btn("📙 السنة الثالثة", "y:3"),
-        btn("📕 السنة الرابعة", "y:4"),
+    rows = [
+        [btn("📢 المعلومات العامة والتعاميم", "gen")],
+        [btn("📅 الجداول الدراسية والامتحانية", "sched")],
+        [btn("📘 السنة الأولى", "y:1"), btn("📗 السنة الثانية", "y:2")],
+        [btn("📙 السنة الثالثة", "y:3"), btn("📕 السنة الرابعة", "y:4")],
+        [btn("🔎 بحث عن مقرر", "search"), btn("⚙️ إعداداتي", "me")],
     ]
-    rows = grid(grid_buttons, 2)
-    # (2) أدوات: البحث والإعدادات جنبًا إلى جنب
-    rows.append([btn("🔎 بحث عن مقرر", "search"), btn("⚙️ إعداداتي", "me")])
-    # (3) التواصل (يظهران فقط إن أضاف المشرف روابطهما)
+    # أزرار التواصل تظهر فقط إن أضاف المشرف روابطها
     extra = []
     if db.get_setting("contact_link"):
         extra.append(btn("📞 تواصل معنا", "contact"))
@@ -1520,7 +1505,7 @@ def main_menu(uid=None):
 
 def contact_screen():
     """شاشة التواصل والقناة."""
-    lines = [crumbs("تواصل معنا"), "📞 <b>تواصل معنا</b>", DIVIDER, ""]
+    lines = ["📞 <b>تواصل معنا</b>", ""]
     contact = db.get_setting("contact_link")
     channel = db.get_setting("channel_link")
     found = False
@@ -1537,7 +1522,7 @@ def contact_screen():
 
 
 def channel_screen():
-    lines = [crumbs("القناة الرسمية"), "📣 <b>القناة الرسمية</b>", DIVIDER, ""]
+    lines = ["📣 <b>القناة الرسمية</b>", ""]
     channel = db.get_setting("channel_link")
     if channel:
         lines.append("<a href='" + esc(channel) + "'>اضغط للانضمام إلى القناة</a>")
@@ -1547,7 +1532,7 @@ def channel_screen():
 
 
 def general_screen():
-    lines = [crumbs("المعلومات العامة"), "📢 <b>المعلومات العامة والتعاميم</b>", DIVIDER, ""]
+    lines = ["📢 <b>المعلومات العامة والتعاميم</b>", ""]
     body = links_block([(label, db.get_setting(key)) for key, label in GENERAL_FIELDS])
     lines.append(body if body else "⚠️ لم تُضَف أي معلومات بعد.")
     return "\n".join(lines), {"inline_keyboard": [go_home_row()]}
@@ -1555,8 +1540,7 @@ def general_screen():
 
 def schedule_screen():
     """الجداول الدراسية والامتحانية: محاضرات، قاعات، امتحانات."""
-    lines = [crumbs("الجداول الدراسية والامتحانية"),
-             "📅 <b>الجداول الدراسية والامتحانية</b>", DIVIDER, "",
+    lines = ["📅 <b>الجداول الدراسية والامتحانية</b>", "",
              "<i>كل الجداول الرسمية في مكان واحد:</i>", ""]
     body = links_block([(label, db.get_setting(key)) for key, label in SCHEDULE_FIELDS])
     lines.append(body if body else "⚠️ لم تُضَف أي جداول بعد.")
@@ -1567,7 +1551,7 @@ def schedule_screen():
 
 def year_screen(year):
     """شاشة السنة: مقرراتها (أو تخصصاتها في السنة الثالثة) + عودة سريعة."""
-    lines = [crumbs(YEAR_TITLES[year]), "<b>" + YEAR_TITLES[year] + "</b>", DIVIDER, ""]
+    lines = ["<b>" + YEAR_TITLES[year] + "</b>", ""]
     gl_line, gl_btn = group_link_block("رابط مجموعة السنة", db.get_year_group(year),
                                        f"gl:y:{year}")
     lines.append(gl_line)
@@ -1607,8 +1591,7 @@ def spec_screen(spec_id):
     spec = db.get_spec(spec_id)
     if not spec:
         return "⚠️ التخصص غير موجود.", {"inline_keyboard": [go_home_row()]}
-    lines = [crumbs(YEAR_TITLES[3], "تخصص: " + spec["name"]),
-             "🎯 <b>" + esc(spec["name"]) + "</b>", DIVIDER, ""]
+    lines = ["🎯 <b>" + esc(spec["name"]) + "</b>", ""]
     gl_line, gl_btn = group_link_block("رابط مجموعة التخصص", spec["group_link"],
                                        f"gl:sp:{spec_id}")
     lines.append(gl_line)
@@ -1640,7 +1623,7 @@ def course_screen(course_id):
     path = [YEAR_TITLES.get(c["year"], "-")]
     if spec_name:
         path.append("تخصص: " + spec_name)
-    lines = [crumbs(*path), "📖 <b>" + esc(c["name"]) + "</b>", DIVIDER]
+    lines = ["📖 <b>" + esc(c["name"]) + "</b>"]
     if spec_name:
         lines.append(f"🎯 التخصص: {esc(spec_name)}")
     lines.append("")
@@ -1684,7 +1667,7 @@ def _deliver_course_file(chat_id, course_id, field, back_label="⬅️ رجوع 
              {"inline_keyboard": [[btn(back_label, f"c:{course_id}")], go_home_row()]})
         return
     value = str(c.get(field) or "").strip()
-    caption = ("🔗 <b>" + label + "</b>\n" + DIVIDER + "\n📖 المقرر: <b>"
+    caption = ("🔗 <b>" + label + "</b>\n📖 المقرر: <b>"
                + esc(c["name"]) + "</b>")
     packed = unpack_tg_file(value)
     if packed:
@@ -1703,8 +1686,8 @@ def _deliver_course_file(chat_id, course_id, field, back_label="⬅️ رجوع 
              {"inline_keyboard": [[btn(back_label, f"c:{course_id}")], go_home_row()]})
         return
     # رابط خارجي عادي
-    lines = [crumbs(YEAR_TITLES.get(c["year"], "-")), "🔗 <b>" + esc(label) + "</b>",
-             DIVIDER, "", "📖 المقرر: <b>" + esc(c["name"]) + "</b>", "",
+    lines = ["🔗 <b>" + esc(label) + "</b>", "",
+             "📖 المقرر: <b>" + esc(c["name"]) + "</b>", "",
              "<a href='" + esc(value) + "'>اضغط هنا لفتح الملف</a>"]
     rows = [[btn(back_label, f"c:{course_id}")], go_home_row()]
     send(chat_id, "\n".join(lines), {"inline_keyboard": rows})
@@ -1724,7 +1707,7 @@ def course_file_screen(course_id, field):
         if spec:
             path.append("تخصص: " + spec["name"])
     path.append(c["name"])
-    lines = [crumbs(*path), "🔗 <b>" + esc(label) + "</b>", DIVIDER, "",
+    lines = ["🔗 <b>" + esc(label) + "</b>", "",
              "📖 المقرر: <b>" + esc(c["name"]) + "</b>", ""]
     if packed:
         fid, fname, _media = packed
@@ -1743,7 +1726,7 @@ def course_file_screen(course_id, field):
 def me_screen(uid):
     """ملف الطالب الشخصي: تعديل الاسم والرقم الجامعي بنفسه."""
     s = db.get_student(uid) or {}
-    lines = [crumbs("إعداداتي"), "⚙️ <b>إعداداتي</b>", DIVIDER, ""]
+    lines = ["⚙️ <b>إعداداتي</b>", ""]
     lines.append("• الاسم: <b>" + (esc(s.get("full_name")) or "— لم يُسجَّل —") + "</b>")
     lines.append("• الرقم الجامعي: <b>" + (esc(s.get("uni_id")) or "— لم يُسجَّل —") + "</b>")
     if s.get("year"):
@@ -1763,7 +1746,7 @@ def me_screen(uid):
 
 def me_year_screen(uid):
     s = db.get_student(uid) or {}
-    lines = [crumbs("إعداداتي", "تعديل السنة"), "🎓 <b>اختر سنتك الدراسية</b>", DIVIDER, ""]
+    lines = ["🎓 <b>اختر سنتك الدراسية</b>", ""]
     rows = [[btn(YEAR_TITLES[y], f"me:setyear:{y}")] for y in YEARS]
     rows.append([btn("⬅️ رجوع", "me")])
     rows.append(go_home_row())
@@ -1800,8 +1783,7 @@ def valid_name(value):
 
 # ---------------------------------------------------------------- admin panel
 def admin_menu():
-    text = ("🛠 <b>لوحة التحكم</b>\n" + DIVIDER
-            + "\nاختر ما تريد إدارته:")
+    text = "🛠 <b>لوحة التحكم</b>\n\nاختر ما تريد إدارته:"
     kb = {
         "inline_keyboard": [
             # المحتوى (شبكة 2×2)
@@ -1843,7 +1825,7 @@ def admin_students_screen(page=0):
     start = page * STUDENTS_PER_PAGE
     chunk = students[start:start + STUDENTS_PER_PAGE]
 
-    lines = [crumbs("لوحة التحكم", "الطلاب"), "👥 <b>إدارة الطلاب</b>", DIVIDER, ""]
+    lines = ["👥 <b>إدارة الطلاب</b>", ""]
     lines.append("العدد الكلي: <b>" + str(total) + "</b>"
                  + ("   •   صفحة " + str(page + 1) + " من " + str(total_pages) if total else ""))
     lines.append("")
@@ -1888,8 +1870,7 @@ def admin_student_card(record_id):
         return ("⚠️ هذا الطالب غير موجود (ربما حُذف بالفعل).",
                 {"inline_keyboard": [[btn("⬅️ رجوع إلى الطلاب", "a:students"),
                                       btn("🏠 الرئيسية", "menu")]]})
-    lines = [crumbs("لوحة التحكم", "الطلاب", "بطاقة طالب"),
-             "👤 <b>" + esc(s.get("full_name") or "بدون اسم") + "</b>", DIVIDER, ""]
+    lines = ["👤 <b>" + esc(s.get("full_name") or "بدون اسم") + "</b>", ""]
     lines.append("🔢 الرقم الجامعي: " + ("<code>" + esc(s.get("uni_id")) + "</code>" if s.get("uni_id") else "— لم يُسجَّل —"))
     lines.append("🎓 السنة: " + esc(YEAR_TITLES.get(s.get("year")) or "— لم تُحدَّد —"))
     if s.get("username"):
@@ -1915,8 +1896,7 @@ def admin_student_delete_confirm(record_id):
     if not s:
         return ("⚠️ هذا الطالب غير موجود (ربما حُذف بالفعل).",
                 {"inline_keyboard": [[btn("⬅️ رجوع إلى الطلاب", "a:students")]]})
-    lines = [crumbs("لوحة التحكم", "الطلاب", "تأكيد الحذف"),
-             "🗑 <b>تأكيد حذف الطالب</b>", DIVIDER, "",
+    lines = ["🗑 <b>تأكيد حذف الطالب</b>", "",
              "👤 الاسم: <b>" + esc(s.get("full_name") or "بدون اسم") + "</b>",
              "🔢 الرقم الجامعي: <b>" + esc(s.get("uni_id") or "—") + "</b>", ""]
     lines.append("⚠️ <b>تأكيد نهائي:</b> سيُحذف سجله بالكامل ولن تصله أي رسالة "
@@ -1931,8 +1911,7 @@ def admin_student_delete_confirm(record_id):
 
 def admin_students_search():
     """يطلب من المشرف نص البحث عن طالب."""
-    lines = [crumbs("لوحة التحكم", "الطلاب", "بحث"),
-             "🔍 <b>البحث عن طالب</b>", DIVIDER, "",
+    lines = ["🔍 <b>البحث عن طالب</b>", "",
              "اكتب أي جزء من:",
              "• اسم الطالب",
              "• رقمه الجامعي",
@@ -1945,8 +1924,7 @@ def admin_students_search():
 def admin_students_search_results(query):
     """نتائج البحث: كل نتيجة مع زر لإدارة الطالب."""
     results = db.find_students(query, limit=12)
-    lines = [crumbs("لوحة التحكم", "الطلاب", "نتائج البحث"),
-             "🔍 <b>نتائج البحث</b>", DIVIDER, "",
+    lines = ["🔍 <b>نتائج البحث</b>", "",
              "بحثك: «<b>" + esc(query) + "</b>»",
              "النتائج: <b>" + str(len(results)) + "</b>", ""]
     if not results:
@@ -1966,8 +1944,7 @@ def admin_students_search_results(query):
 def admin_students_delete_all_confirm():
     """تأكيد حذف كل سجلات الطلاب (خطوة خطيرة)."""
     total = db.count_students()
-    lines = [crumbs("لوحة التحكم", "الطلاب", "حذف الكل"),
-             "⚠️ <b>حذف كل سجلات الطلاب</b>", DIVIDER, "",
+    lines = ["⚠️ <b>حذف كل سجلات الطلاب</b>", "",
              "العدد الحالي: <b>" + str(total) + "</b>", ""]
     lines.append("سيُحذف <b>كل سجل طالب</b> في البوت نهائيًا.")
     lines.append("✅ <b>لن تتأثّر</b> المقررات ولا الجداول ولا التخصصات ولا معلومات الجامعة.")
@@ -1990,7 +1967,7 @@ def is_registered_student(s):
 
 
 def admin_broadcast_screen():
-    lines = ["📣 <b>بث عام</b>", DIVIDER, "",
+    lines = ["📣 <b>بث عام</b>", "",
              "أرسل رسالة تصل إلى <b>كل الطلاب المسجّلين</b>.", "",
              "• يمكنك استخدام التنسيق: <b>عريض</b> و <i>مائل</i>.", ""]
     n = len(db.all_chat_ids())
@@ -2003,7 +1980,7 @@ def admin_broadcast_screen():
 
 
 def admin_export_screen():
-    lines = ["📤 <b>تصدير البيانات</b>", DIVIDER, "",
+    lines = ["📤 <b>تصدير البيانات</b>", "",
              "اختر الصيغة التي تريدها:", "",
              "• <b>Excel</b> — ملف جاهز يفتح على الجوال مباشرة.", 
              "• <b>CSV</b> — لتشغيله على أي برنامج جداول.", ""]
@@ -2016,7 +1993,7 @@ def admin_export_screen():
 def admin_bot_screen():
     """شاشة تعديل مظهر البوت واسمه ونصوصه."""
     title = db.get_setting("bot_title") or db.get_setting("university_name") or "المرشد الجامعي"
-    lines = ["🎨 <b>مظهر البوت وإعداداته</b>", DIVIDER, ""]
+    lines = ["🎨 <b>مظهر البوت وإعداداته</b>", ""]
     lines.append("العنوان الحالي: <b>" + esc(title) + "</b>")
     lines.append("")
     shown = False
@@ -2131,7 +2108,7 @@ def admin_move_course_screen(course_id):
     c = db.get_course(course_id)
     if not c:
         return "⚠️ غير موجود.", {"inline_keyboard": [[btn("⬅️ رجوع", "a:menu")]]}
-    lines = ["🎯 <b>نقل المقرر إلى تخصص</b>", DIVIDER, "",
+    lines = ["🎯 <b>نقل المقرر إلى تخصص</b>", "",
              "المقرر: <b>" + esc(c["name"]) + "</b>", "",
              "<i>اختر التخصص الذي ينتمي إليه هذا المقرر:</i>"]
     rows = [[btn(f"🎯 {s['name']}", f"a:setc:{course_id}:{s['id']}")] for s in db.list_specs()]
@@ -2512,7 +2489,7 @@ def admin_callback(chat_id, uid, data):
         label = dict(COURSE_FIELDS)[field]
         save_pending(uid, ("course_link", (cid, field)))
         send(chat_id,
-             f"✏️ <b>تعديل: {esc(label)}</b>\n{DIVIDER}\n\n"
+             f"✏️ <b>تعديل: {esc(label)}</b>\n\n"
              "يمكنك الآن أحد أمرين:\n"
              "📎 <b>ارفع الملف مباشرة</b> — ملف PDF/Word، صورة، مقطع فيديو، "
              "أو حتى تسجيل صوتي — وسيُحفظ ويظهر للطلاب.\n"
